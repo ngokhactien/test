@@ -1,0 +1,2787 @@
+﻿# 🛠️ VAAPP Plugin Developer Kit
+
+## App Hoạt Động Như Nào?
+
+VAAPP là một **trình vỏ (Shell)** — nó chỉ lo UI và Player. Toàn bộ nội dung phim/truyện được cung cấp qua **Plugin JS** do bạn viết.
+
+### Luồng Dữ Liệu Chi Tiết
+
+```
+NGƯỜI DÙNG bấm vào mục "Hành Động" trên Trang chủ
+        │
+        ▼
+┌─ APP gọi: getUrlList("hanh-dong", '{"page":1}') ─────────────────┐
+│  Plugin trả: "https://phim.com/the-loai/hanh-dong?page=1"        │
+│  (có thể kèm data riêng: ".../hanh-dong?page=1|data:token")      │
+└───────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─ APP tách phần |… rồi fetch HTTP GET URL SẠCH ────────────────────┐
+│  • |data:…  → giữ lại cho plugin, KHÔNG gửi lên server            │
+│  • |Key=Val → gắn thành HTTP header                               │
+│  Nhận toàn bộ HTML/JSON thô từ server                             │
+└───────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─ APP gọi: parseListResponse(html, apiUrl) ────────────────────────┐
+│  apiUrl = URL GỐC (còn nguyên |data:…) do plugin sinh ra          │
+│  Plugin parse HTML → trả JSON: { items: [{id, title, poster}...]} │
+└───────────────────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─ APP render danh sách phim lên UI ────────────────────────────────┐
+│  Người dùng bấm vào 1 phim → Lặp lại chu trình với Detail/Play   │
+└───────────────────────────────────────────────────────────────────┘
+```
+
+> 🔑 **Ghi nhớ 1 câu**: App **luôn fetch URL đã cắt bỏ phần `|`**, nhưng **luôn truyền lại URL đầy đủ (có `|`)** cho hàm `parseXxx` ở tham số thứ 2. Chi tiết ở chương [⚡ Quy Ước Dấu `|`](#-quy-ước-dấu--pipe--header-hay-data-của-plugin).
+
+### Luồng Xem Phim & Truyền Hình IPTV (Chi Tiết → Player)
+
+```
+NẾU type = "IPTV" HOẶC "VIDEO":
+   App bỏ qua màn hình Chi tiết (Detail Screen) → mở thẳng Màn hình Player
+   App chạy ngầm luồng lấy link:
+      1. Gọi getUrlDetail(id) để lấy URL API chi tiết kênh (lưu ý: id ban đầu là URL gốc chưa có query param)
+      2. App fetch HTTP URL đó (Hỗ trợ Kodi Pipe Header: "url|User-Agent=...&Referer=...")
+      3. App gọi parseDetailResponse(html, apiUrl) để lấy JSON luồng phát & DRM
+      4. ExoPlayer tự động nạp User-Agent/DRM Key và phát video
+
+NẾU type = "MOVIE" / "shortfilm":
+   Bước 1: parseMovieDetail(html, apiUrl)
+      → Trả servers + episodes (mỗi episode có id = URL hoặc slug, bắt buộc slug phải duy nhất cho từng tập)
+
+   Bước 2: Người dùng chọn tập
+      → App gọi getUrlDetail(episode.id) để lấy URL fetch
+      → App tách phần |… → fetch URL sạch → gọi parseDetailResponse(html, apiUrl)
+
+   Bước 3: parseDetailResponse(html, apiUrl)
+      → apiUrl còn nguyên phần |data:… nếu plugin có gắn
+      → Trả { url, headers, mimeType, subtitles, drmType, drmKid, drmKey, drmLicenseKey }
+
+   Bước 4:
+      ├─ Nếu isEmbed = false → ExoPlayer phát url trực tiếp
+      ├─ Nếu isEmbed = true  → App fetch tiếp → gọi parseEmbedResponse()
+      │                        (lặp tối đa 3 lần cho đến khi isEmbed = false)
+      └─ Nếu playerType = "embed" → WebView load url
+
+NẾU type = "COMIC" / "MANGA" / "NOVEL":
+   Bước 1: parseMovieDetail(html, apiUrl)
+      → Trả servers + episodes (mỗi episode đại diện cho 1 Chapter truyện, có id = URL/slug, bắt buộc slug phải duy nhất cho từng chapter)
+
+   Bước 2: Người dùng chọn đọc Chapter (hoặc App tự mở lại từ Lịch sử đọc)
+      → App gọi getUrlDetail(episode.id) để lấy URL fetch
+      → App tách phần |… → fetch URL sạch → gọi parseDetailResponse(html, apiUrl)
+
+   Bước 3: parseDetailResponse(html, apiUrl)
+      ├─ Cách 1 (Khuyên dùng): Trả { images: ["url_anh_1", "url_anh_2", ...], headers: { "Referer": "..." } }
+      │  → App mở Trình Đọc Truyện Native (Compose Manga Reader) với 5 chế độ đọc, tự động cuộn, đọc nối tiếp vô hạn...
+      └─ Cách 2: Trả { url: "https://web.com/chap-1", isEmbed: true, headers: {...} }
+         → App mở WebView nhúng với cơ chế tự động proxy ảnh và diệt popup quảng cáo
+```
+
+> 💡 **LƯU Ý QUAN TRỌNG KHI VIẾT PLUGIN (Tránh lỗi mất param & gọi sai tập/chương):**
+> 1. **Gán Param Mặc Định:** Khi phát kiểu `VIDEO` (hoặc bấm Play từ ngoài), `apiUrl` truyền vào `parseDetailResponse` là URL gốc chưa có param. Plugin nên gán giá trị mặc định trong `getUrlDetail()` hoặc `parseDetailResponse()` (ví dụ: `if (!url.includes("streamVD=")) url += "?streamVD=1";`).
+> 2. **Slug Tập / Chapter Phải Duy Nhất (`slug`):** Mỗi episode trong mảng `episodes` bắt buộc phải có `slug` độc nhất (ví dụ: `ep-1`, `ep-2`, `chap-1`, `chap-2`). **KHÔNG ĐẶT TRÙNG SLUG** (như tất cả tập/chương đều là `"slug": "full"`), vì cơ chế Preload / Tải nối tiếp ngầm và Lưu lịch sử đọc dở của App dùng `slug` để xác định vị trí hiện tại — nếu trùng slug, App sẽ không thể khôi phục đúng chương/trang dở dang!
+
+---
+
+## 📺 Cấu Hình Đặc Thù Cho Plugin IPTV & Mã Hóa DRM (ClearKey / Widevine)
+
+### 1. Manifest Plugin IPTV (`getManifest`)
+```javascript
+function getManifest() {
+  return JSON.stringify({
+    "id": "my_iptv_plugin",
+    "name": "Kênh Truyền Hình IPTV",
+    "baseUrl": "https://tv.example.com",
+    "isEnabled": true,
+    "debug": true,         // Bật debug=true để hiện Console Toast Log nổi trên màn hình
+    "type": "IPTV",        // Khai báo kiểu IPTV
+    "layoutType": "HORIZONTAL",
+    "playerType": "exoplayer"
+  });
+}
+```
+
+### 2. Cấu Hình DRM trong `parseDetailResponse()`
+
+#### Cách A: Trả về cặp chìa khóa ClearKey dạng Offline Hex (Khuyên dùng)
+Nếu plugin đã trích xuất được cặp `KID` và `KEY` dạng Hex 32 ký tự:
+```javascript
+function parseDetailResponse(html, apiUrl) {
+  return JSON.stringify({
+    isEmbed: false,
+    url: "https://cdn.example.com/live/manifest.mpd",
+    mimeType: "application/dash+xml",
+    drmType: "clearkey",
+    drmKid: "c410ddc6a75244639fd0561fba5ef19b", // Hex KID 32 ký tự
+    drmKey: "30d13ea42031b9ff8271e5dc37d90e10"   // Hex KEY 32 ký tự
+  });
+}
+```
+👉 **Cơ chế:** ExoPlayer giải mã trực tiếp nội tuyến mà không phát bất kỳ HTTP request DRM nào lúc phát!
+
+#### Cách B: Trả về URL License Server kèm `headers` (`User-Agent`)
+Nếu ExoPlayer cần tự gọi HTTP Request lên URL để xin chìa khóa và bắt buộc có `User-Agent`:
+```javascript
+function parseDetailResponse(html, apiUrl) {
+  return JSON.stringify({
+    isEmbed: false,
+    url: "https://cdn.example.com/live/manifest.mpd",
+    mimeType: "application/dash+xml",
+    drmType: "clearkey", // Hoặc "widevine"
+    drmLicenseKey: "https://tv.example.com/key.php?id=...",
+    headers: {
+      "User-Agent": "Dalvik/2.1.0", // Hoặc User-Agent yêu cầu của server nguồn
+      "Referer": "https://tv.example.com/"
+    }
+  });
+}
+```
+👉 **Cơ chế:** Đối tượng `headers` khai báo ở đây sẽ được ExoPlayer đính kèm trực tiếp vào HTTP Request khi tự động phát lệnh lấy chìa khóa DRM!
+
+### 3. Cú pháp Kodi Pipe Header (`|`)
+App hỗ trợ cú pháp Kodi Pipe Header tại mọi điểm truyền URL:
+- **Truyền Custom User-Agent cho bước App fetch URL chi tiết kênh**:  
+  `"id": "https://tv.example.com/channel?id=90|User-Agent=Dalvik/2.1.0&Referer=https://tv.example.com/"`
+- **Truyền Custom User-Agent cho URL License Server**:  
+  `"drmLicenseKey": "https://tv.example.com/key.php?id=...|User-Agent=Dalvik/2.1.0"`
+
+App sẽ tự động loại bỏ cú pháp `|` để lấy URL sạch và trích xuất đúng các tham số Header nạp vào Request!
+
+👉 Dấu `|` còn dùng để **mang dữ liệu riêng của plugin** (token, key, encodeData…) — xem chương [⚡ Quy Ước Dấu `|`](#-quy-ước-dấu--pipe--header-hay-data-của-plugin) ngay dưới đây.
+
+---
+
+## ⚡ Quy Ước Dấu `|` (Pipe) — Header Hay Data Của Plugin?
+
+> 🆕 **CẬP NHẬT QUAN TRỌNG (bản mới nhất)** — Nếu plugin của bạn đang nhét dữ liệu riêng sau dấu `|`, hãy đọc kỹ mục này.
+
+Mọi URL do plugin trả về (`getUrlList`, `getUrlSearch`, `getUrlDetail`, `episode.id`, `item.id`…) đều có thể mang thêm một phần phụ sau dấu `|`:
+
+```
+<url thật>|<phần thêm>
+```
+
+App **luôn cắt bỏ toàn bộ phần sau dấu `|` trước khi gửi HTTP request**. Phần `|…` không bao giờ đi lên server. Nhưng nó vẫn được **truyền nguyên vẹn trở lại cho hàm `parseXxx(html, apiUrl)`** ở tham số thứ 2.
+
+### 3 dạng của phần sau dấu `|`
+
+| # | Dạng | Ví dụ | App xử lý |
+|---|------|-------|-----------|
+| 1 | **`data:` tường minh** ⭐ Khuyến nghị | `.../slug\|data:encodeData`<br>`.../slug\|data:type=movie&ep=3` | Luôn coi là **DATA của plugin**. Không gắn header. Không bao giờ bị hiểu nhầm. |
+| 2 | **Headers** (cặp `key=value`) | `.../slug\|Referer=https://x&User-Agent=Dalvik/2.1.0` | Gắn vào **HTTP request headers** |
+| 3 | **Data kiểu cũ** (không có dấu `=`) | `.../slug\|encodeData`<br>`.../slug\|ABC123XYZ` | Coi là **DATA của plugin** (tương thích ngược) |
+
+**Thứ tự ưu tiên**: App kiểm tra dạng 1 trước → dạng 2 → dạng 3.
+
+### ⚠️ Cạm bẫy lớn nhất: data của bạn chứa dấu `=`
+
+```javascript
+// ❌ SAI — "type=movie" trông y hệt một cặp header key=value
+//    → App gắn header "type: movie" và MẤT dữ liệu của bạn
+"id": "https://site.com/phim/abc|type=movie&quality=1080p"
+
+// ✅ ĐÚNG — thêm tiền tố "data:" là hết đoán mò
+"id": "https://site.com/phim/abc|data:type=movie&quality=1080p"
+```
+
+### Bảng so sánh nhanh
+
+| URL plugin trả về | App fetch URL | Header gắn thêm | `apiUrl` (Tham số 2) | `datasend` (Tham số 3) |
+|-------------------|---------------|-----------------|----------------------|------------------------|
+| `https://s.com/a\|data:xyz` | `https://s.com/a` | *(không)* | `https://s.com/a` (Sạch) | `xyz` |
+| `https://s.com/a\|data:k=v` | `https://s.com/a` | *(không)* | `https://s.com/a` (Sạch) | `k=v` |
+| `https://s.com/a\|Referer=https://s.com` | `https://s.com/a` | `Referer: https://s.com` | `https://s.com/a` (Sạch) | *(rỗng)* |
+| `https://s.com/a\|xyz` | `https://s.com/a` | *(không)* | `https://s.com/a` (Sạch) | `xyz` |
+| `https://s.com/a?ids=1\|2\|3` | `https://s.com/a?ids=1\|2\|3` | *(không)* | URL nguyên vẹn | *(rỗng)* |
+
+### 🔓 Ngoại lệ: dấu `|` nằm trong query string
+
+Nếu dấu `|` xuất hiện **sau dấu `?`** và **không** thuộc dạng 1 hoặc dạng 2, App coi đó là **ký tự dữ liệu hợp lệ của URL** và giữ nguyên khi fetch:
+
+```javascript
+// | là dữ liệu thật của API → App fetch nguyên URL, KHÔNG cắt
+return "https://api.site.com/movies?ids=101|102|103";
+```
+
+Nhưng nếu bạn muốn phần đó là data của plugin (không gửi lên server) kể cả khi nằm sau `?`, **bắt buộc dùng tiền tố `data:`**:
+
+```javascript
+// data: thắng mọi quy tắc khác → App fetch "https://api.site.com/m?page=1"
+return "https://api.site.com/m?page=1|data:secretToken";
+```
+
+### 📦 Truyền Dữ Liệu `datasend` Liền Mạch Giữa Các Màn Hình & Bỏ Qua Fetch Lại Chi Tiết
+
+Hệ thống hỗ trợ truyền và bảo tồn thuộc tính `datasend` tự động qua từng màn hình (Home/List → Detail → Player/Reader):
+
+#### 1. Từ Danh sách phim sang Chi tiết phim (`parseMovieDetail`)
+Khi `parseListResponse()` hoặc `parseSearchResponse()` trả về item có `datasend` (hoặc `id` dạng `slug|data:...`), App tự động trích xuất chuỗi data này và truyền thẳng vào tham số thứ 3 của hàm `parseMovieDetail(html, apiUrl, datasend)` và tham số thứ 2 của `getUrlDetail(slug, datasend)`.
+
+---
+
+#### ⚡ Kỹ Thuật: Bỏ Qua Fetch Lại Chi Tiết Phim Khi List Đã Có Sẵn Dữ Liệu (Tải Tức Thì 0ms)
+
+Nếu API danh sách phim của bạn đã trả về đầy đủ thông tin chi tiết (hoặc bạn đã có sẵn link video / danh sách tập), bạn có thể **bỏ qua hoàn toàn bước gọi HTTP tải HTML chi tiết**:
+
+##### Cách 1: `getUrlDetail(slug, datasend)` trả về trực tiếp chuỗi JSON của `MovieDetail` ⭐ (Khuyên Dùng)
+Khi `getUrlDetail` trả về chuỗi JSON object (bắt đầu bằng `{` và kết thúc bằng `}`), App sẽ **bỏ qua 100% việc gửi HTTP request** và nạp thẳng `MovieDetail` vào màn hình chi tiết:
+
+```javascript
+// 1. Ở parseListResponse: Đóng gói dữ liệu phim vào datasend
+function parseListResponse(html, apiUrl) {
+    var movies = [];
+    // ... lặp qua các item ...
+    movies.push({
+        id: item.slug,
+        title: item.title,
+        posterUrl: item.poster,
+        datasend: JSON.stringify({
+            id: item.slug,
+            title: item.title,
+            posterUrl: item.poster,
+            description: item.description,
+            servers: [{
+                name: "VIP",
+                episodes: [{ name: "Full", slug: "full", id: item.streamUrl }]
+            }]
+        })
+    });
+    return JSON.stringify({ items: movies, pagination: { currentPage: 1, totalPages: 1 } });
+}
+
+// 2. Ở getUrlDetail: Trả về thẳng datasend (App sẽ bỏ qua fetch HTTP)
+function getUrlDetail(slug, datasend) {
+    if (datasend) {
+        return datasend; // Trả về chuỗi JSON MovieDetail trực tiếp!
+    }
+    return "https://site.com/phim/" + slug;
+}
+```
+
+##### Cách 2: `getUrlDetail(slug, datasend)` trả về chuỗi rỗng `""`
+Khi `getUrlDetail` trả về `""`, App sẽ không gọi HTTP mà gọi thẳng `parseMovieDetail("", "", datasend)`:
+
+```javascript
+function getUrlDetail(slug, datasend) {
+    return ""; // Trả về rỗng -> App không fetch HTTP
+}
+
+function parseMovieDetail(html, apiUrl, datasend) {
+    var detail = JSON.parse(datasend || "{}");
+    return JSON.stringify({
+        id: detail.id,
+        title: detail.title,
+        posterUrl: detail.posterUrl,
+        servers: detail.servers || []
+    });
+}
+```
+
+---
+
+#### 2. Từ Chi tiết phim sang Phát video (`getStreamLink` / `parseDetailResponse`)
+Tương tự, nếu từng tập phim trong mảng `episodes` có `datasend` (hoặc `id` dạng `ep-1|data:...`), App bảo toàn và truyền chuỗi này vào:
+- `getStreamLink(episodeId, datasend)`
+- `parseDetailResponse(html, apiUrl, datasend)`
+
+Giúp dev plugin truyền nguyên vẹn các token mã hóa, key giải mã hoặc tham số riêng giữa các bước mà không lo bị rơi mất khi chuyển giao diện.
+
+---
+
+#### 🛡️ Cơ Chế Tự Động Làm Sạch URL của App
+- Khi plugin trả về URL hoặc ID có chứa `|data:...` (hoặc `datasend`), App **luôn tự động cắt bỏ phần `|data:...` trước khi gửi HTTP request lên server**, đảm bảo URL fetch luôn là URL sạch (`https://site.com/path`).
+- Server của trang web sẽ **không bao giờ nhận chuỗi `|datasend`**, tránh triệt để lỗi `400 Bad Request` hoặc `404 Not Found`.
+- Chuỗi data thô được bảo toàn nguyên vẹn và truyền vào tham số `datasend` của các hàm parse.
+
+### Cách bóc data trong hàm parse (Helper)
+
+```javascript
+// Helper nhỏ gọn — dùng chung cho mọi plugin
+function getPipeData(apiUrl) {
+    if (!apiUrl) return "";
+    var i = apiUrl.indexOf("|");
+    if (i < 0) return "";
+    var s = apiUrl.substring(i + 1).replace(/^\s+/, "");
+    // Bỏ tiền tố "data:" nếu có (không phân biệt hoa thường)
+    if (s.toLowerCase().indexOf("data:") === 0) {
+        s = s.substring(5);
+    }
+    return s;
+}
+
+function parseMovieDetail(html, apiUrl, datasend) {
+    // Ưu tiên đọc từ datasend trực tiếp (tham số thứ 3)
+    var data = datasend || getPipeData(apiUrl);
+    console.log("data nhận được:", data);
+    // ...
+}
+```
+
+> 💡 Hàm tương ứng bên App là `extractPluginPipeData()` trong `PluginExecutor.kt` — logic giống hệt helper trên.
+
+### ✅ Checklist khi dùng dấu `|` & `datasend`
+
+- [ ] Dữ liệu riêng của plugin dạng chuỗi/JSON → gán vào trường `datasend` hoặc viết `|data:...`
+- [ ] Muốn bỏ qua fetch HTTP chi tiết phim → `getUrlDetail(slug, datasend)` trả về chuỗi JSON `MovieDetail` trực tiếp hoặc trả về `""`
+- [ ] Header HTTP thật → viết `|Key=Value&Key2=Value2` (KHÔNG có `data:`)
+- [ ] Không trộn lẫn: một URL chỉ nên có **một** dấu `|` đầu tiên mang ý nghĩa; ký tự `|` sau đó thuộc về phần data
+- [ ] Muốn truyền Object lớn qua URL string → `encodeURIComponent(JSON.stringify(obj))` rồi ghép: `"|data:" + encoded`
+
+---
+
+## 🚀 Bắt Đầu Nhanh (3 Bước)
+
+### Bước 1: Tạo Plugin
+Copy file `plugin_template.js` → đổi tên `ten_web_plugin.js`, bắt đầu viết code.
+
+### Bước 2: Test Trên Máy Tính
+Mở file **`tester.html`** bằng Chrome:
+1. **Nạp JS**: Bấm "Nạp file JS" → chọn file plugin của bạn
+2. **Dán HTML**: Mở trang phim → Ctrl+U (View Source) → copy dán vào ô input
+3. **Chạy thử**: Bấm các nút `parseListResponse()`, `parseMovieDetail()`...
+4. **Xem kết quả**: Xanh = JSON chuẩn ✅ | Đỏ = lỗi cần sửa ❌
+
+### Bước 3: Đăng Ký
+Upload file `.js` lên GitHub Raw → thêm vào `plugins.json` → App tự cập nhật.
+
+### ⚠️ Lưu Ý Quan Trọng Khi Phát Hành Plugin (Mới)
+
+#### 1. Bắt Buộc Sử Dụng Link RAW
+Khi đăng ký plugin trên file JSON hoặc thêm nguồn tùy chỉnh, đường dẫn file JS **bắt buộc phải là đường dẫn RAW** trả về code JavaScript thô.
+*   **Sai:** `https://github.com/user/repo/blob/main/plugin.js` (Trả về giao diện web HTML của GitHub).
+*   **Từ phiên bản App 1.7.5+**: Hỗ trợ thêm link gist/custom domain nhưng nên dùng link RAW.
+
+#### 2. Dung Thứ Dấu Phẩy Thừa & Cấu Trúc Bỏ Ngỏ (Trailing Comma & Loose Schema)
+*   Từ phiên bản ứng dụng **1.7.5+**, bộ phân tích cú pháp JSON của App đã hỗ trợ `allowTrailingComma = true`.
+*   **`FilterOption`**: Trường `value` giờ đây có giá trị mặc định. Nếu plugin khai báo `{ "slug": "/cat-1", "name": "Tên" }` thay vì `value`, App vẫn tự chuyển đổi slug thành `value` mà không crash `MissingFieldException`.
+
+#### 3. Tối Ưu `getUrlDetail` & Tránh OOM (Out Of Memory)
+*   Nếu `getUrlDetail(slug)` nhận được link stream trực tiếp (`.mp4`, `.m3u8`, `.mpd`,...):
+    *   **Khuyến nghị**: Hãy `return JSON.stringify({ "url": directUrl, "isEmbed": false, "mimeType": "..." })` ngay lập tức!
+    *   **Cơ chế bảo vệ từ App**: Nếu `getUrlDetail` trả về URL video trực tiếp (plain string), App sẽ tự động phát hiện và bỏ qua bước fetch HTML (tránh sập bộ nhớ OOM) đồng thời tự động nhận diện `mimeType`.
+
+---
+
+#### 4. Cơ Chế Phòng Lỗi Khi `parseEmbedResponse` Trả Về URL Rỗng
+*   Nếu plugin dùng `isEmbed: true` nhưng hàm `parseEmbedResponse` lỡ trả về `url: ""` (rỗng):
+    *   **Từ bản 1.7.8+**: App sẽ tự động phát hiện và **giữ lại URL embed trước đó**, tiếp tục mở WebView và bật Sniffer thay vì bị lỗi rỗng luồng phát.
+
+#### 5. Không Nhét Dữ Liệu Plugin Vào URL Mà Không Có Tiền Tố `data:`
+*   Xem chi tiết ở chương [⚡ Quy Ước Dấu `|`](#-quy-ước-dấu--pipe--header-hay-data-của-plugin).
+*   Tóm tắt: dữ liệu riêng của plugin phải viết `url|data:<dữ liệu>`. Nếu không có tiền tố `data:` mà dữ liệu lại chứa dấu `=`, App sẽ hiểu nhầm thành HTTP header và dữ liệu của bạn bị mất.
+
+---
+
+## 📋 Danh Sách Tất Cả Các Hàm
+
+### Nhóm 1: Config (Khai báo)
+
+| Hàm | Trả về | Bắt buộc |
+|-----|--------|----------|
+| `getManifest()` | Thông tin plugin | ✅ |
+| `getHomeSections()` | Các mục trang chủ | ✅ |
+| `getPrimaryCategories()` | Menu thể loại | Tùy chọn |
+| `getFilterConfig()` | Bộ lọc | Tùy chọn |
+
+### Nhóm 2: URL (Sinh đường dẫn)
+
+| Hàm | Tham số | Trả về | Tùy chọn / Ghi chú |
+|-----|---------|--------|-------------------|
+| `getUrlList(slug, filtersJson)` | slug mục + filters | URL string | ✅ Bắt buộc |
+| `getUrlSearch(keyword, filtersJson)` | từ khóa | URL string | ✅ Bắt buộc |
+| `getUrlDetail(slug)` | slug phim | URL string | ✅ Bắt buộc |
+| `getStreamLink(movieSlug)` | slug phim | JSON string spec | Tùy chọn (Bỏ qua fetch HTML) |
+| `getUrlCategories()` | — | URL string | Tùy chọn (Trang thể loại) |
+| `getUrlCountries()` | — | URL string | Tùy chọn (Trang quốc gia) |
+| `getUrlYears()` | — | URL string | Tùy chọn (Trang năm) |
+
+### Nhóm 3: Parser (Xử lý dữ liệu) ⭐
+
+> ⚠️ **Tất cả hàm parse đều nhận 2 tham số**: `(html, apiUrl)`.
+> `apiUrl` là **URL gốc do plugin sinh ra, còn nguyên phần `|data:...`** (nếu có) — không phải URL sạch mà App đã fetch.
+> Nếu URL không có dấu `|`, `apiUrl` là **URL cuối cùng sau khi redirect** (`response.request.url`), tiện để ghép link tương đối.
+
+| Hàm | Nhận vào | Trả về |
+|-----|----------|--------|
+| `parseListResponse(html, apiUrl)` | HTML/JSON thô + URL đã gọi | `{ items: [...], pagination: {...} }` |
+| `parseSearchResponse(html, apiUrl)` | HTML/JSON thô + URL đã gọi | Giống parseListResponse |
+| `parseMovieDetail(html, apiUrl, datasend)` | HTML chi tiết + URL đã gọi + datasend | `{ id, title, servers: [...], ... }` |
+| `parseDetailResponse(html, apiUrl, datasend)` | HTML trang xem + URL đã gọi + datasend | `{ url, headers, mimeType, ... }` |
+| `parseEmbedResponse(html, url)` | HTML embed page + URL embed | `{ url, isEmbed, mimeType, ... }` |
+| `parseCategoriesResponse(html, apiUrl)` | HTML thể loại | Mảng `Category` hoặc `FilterOption` |
+| `parseCountriesResponse(html)` | HTML quốc gia | Mảng `FilterOption` |
+| `parseYearsResponse(html)` | HTML năm | Mảng `FilterOption` |
+
+> 💡 Các tham số `apiUrl` và `datasend` là **tùy chọn** — plugin cũ chỉ khai báo `function parseListResponse(html)` vẫn chạy bình thường. Khai báo thêm khi bạn cần đọc `datasend`, `|data:` hoặc cần biết domain thật sau redirect.
+
+---
+
+## 📐 Data Format Chi Tiết
+
+### `getManifest()` — Thông tin Plugin
+
+```json
+{
+    "id": "unique_id",
+    "name": "Tên Hiển Thị",
+    "version": "1.0.0",
+    "description": "Mô tả ngắn về plugin",
+    "author": "Tên tác giả",
+    "baseUrl": "https://phim.example.com",
+    "fallbackUrls": ["https://phim2.example.com", "https://phim3.example.com"],
+    "iconUrl": "https://icon.png",
+    "referrer": "https://phim.example.com/",
+    "info": "Ghi chú hiện trong màn hình Quản lý Plugin",
+    "isEnabled": true,
+    "isAdult": false,
+    "type": "MOVIE",
+    "layoutType": "VERTICAL",
+    "playerType": "exoplayer",
+    "subtitleCat": false,
+    "adblock": true,
+    "debug": false
+}
+```
+
+**Bảng đầy đủ các trường:**
+
+| Trường | Kiểu | Mặc định | Ý nghĩa |
+|--------|------|----------|---------|
+| `id` | String | *(bắt buộc)* | ID duy nhất của plugin |
+| `name` | String | *(bắt buộc)* | Tên hiển thị |
+| `version` | String | *(bắt buộc)* | Phiên bản, dùng để so sánh khi cập nhật |
+| `description` | String | `""` | Mô tả ngắn |
+| `author` | String | `""` | Tác giả |
+| `baseUrl` | String | `""` | Domain chính của web nguồn |
+| `fallbackUrls` | Array\<String\> | `[]` | Danh sách domain dự phòng khi `baseUrl` bị chặn — xem mục [🌐 Domain Fallback](#-domain-fallback--tự-đổi-domain-khi-bị-chặn) |
+| `iconUrl` | String | `""` | Link icon plugin |
+| `referrer` / `imageReferer` | String | `""` | Header `Referer` chung khi tải **ảnh poster & ảnh trang truyện** (vượt chặn hotlink 403 Forbidden) |
+| `info` | String | `""` | Ghi chú/hướng dẫn riêng hiện trong màn Quản lý Plugin |
+| `isEnabled` | Boolean | `true` | Bật/tắt plugin |
+| `isAdult` | Boolean | `false` | Đánh dấu nội dung 18+ |
+| `type` | Enum | `MOVIE` | `MOVIE` / `VIDEO` / `COMIC` / `MANGA` / `NOVEL` / `IPTV` / `SHORTFILM` |
+| `layoutType` | Enum | `VERTICAL` | `VERTICAL` (poster 2:3) / `HORIZONTAL` (thumb 16:9) |
+| `playerType` | Enum | `auto` | `exoplayer` / `embed` / `embedtoexoplay` / `auto` |
+| `subtitleCat` | Boolean | `false` | Bật tự tìm phụ đề từ subtitlecat.com |
+| `adblock` | Boolean | `true` | Bật/tắt bộ chặn quảng cáo nền |
+| `debug` | Boolean | `false` | Bật Console Toast nổi |
+| `popup_notice` | String | `""` | Thông báo Popup tùy biến (Text, HTML, CSS, Ảnh QR...) hiện ở trang chủ plugin 1 lần/phiên |
+| `popup_html` | String | `""` | Alias tương thích cho `popup_notice` |
+| `popup_notice` | String | `""` | Thông báo Popup tùy biến (Text, HTML, CSS, Ảnh QR...) hiện ở trang chủ plugin 1 lần/phiên |
+| `popup_html` | String | `""` | Alias tương thích cho `popup_notice` |
+
+**`debug` — Console Toast dành cho phát triển plugin:**
+- Không khai báo `debug`, hoặc đặt `"debug": false`: Console Toast **không hiển thị**.
+- Đặt `"debug": true`: Bật hiển thị cửa sổ overlay **Console Toast** cho plugin đó trong App.
+- App cũng tương thích với dạng string `"debug": "true"` và `"debug": "false"`, nhưng nên dùng Boolean chuẩn `true`/`false`.
+- **Cách ghi log trong plugin**: App đã tắt chế độ tự động ngắt/in log mọi hàm chạy qua QuickJS. Để hiển thị log lên Console Toast (và logcat), dev plugin cần **chủ động gọi `console.log(...)`** hoặc `print(...)`, `console.error(...)`, `console.warn(...)` bên trong các hàm JS của plugin.
+- Cửa sổ Console Toast tự động điều chỉnh xuống dòng sát mép trái, hỗ trợ cuộn, phóng to/thu nhỏ và nút Sao chép để copy toàn bộ log.
+
+Ví dụ:
+
+```javascript
+function getManifest() {
+    return JSON.stringify({
+        id: "my_plugin",
+        name: "My Plugin",
+        version: "1.0.0",
+        baseUrl: "https://example.com",
+        playerType: "exoplayer",
+        debug: true
+    });
+}
+
+function parseListResponse(html, apiUrl) {
+    console.log("URL đã fetch:", apiUrl);
+    console.log("Parsing HTML list response length: " + html.length);
+    // ...
+}
+```
+
+> Biến riêng như `DEV = "true"` không bật Console Toast. Cờ phải nằm trong object do `getManifest()` trả về và có tên chính xác là `debug`.
+
+#### 🧩 Gán Biến Trong Manifest (popup_html...)
+
+Để tránh nhồi một khối HTML dài vào trong `getManifest()`, bạn có thể khai báo giá trị ở **bất kỳ đâu trong file JS** (đầu file, ngoài hàm, hoặc trong hàm trước `return`) rồi tham chiếu tên biến:
+
+```javascript
+// Khai báo ở đầu file — khỏi lòi ra khối HTML dài trong getManifest()
+var DONATE_HTML = `<div class='donate-container'>
+    <h2 class='donate-heading'>DONATE</h2>
+    <p class='donate-description'>Ủng hộ bọn mình nhé!</p>
+</div>`;
+
+function getManifest() {
+    return JSON.stringify({
+        "id": "vlxx",
+        "name": "VLXX",
+        "version": "1.0.3",
+        "popup_html": DONATE_HTML,
+        "isEnabled": true
+    });
+}
+```
+
+> ⚠️ **Lưu ý:** Giá trị phải là **một string literal duy nhất** (một cặp dấu nháy). App KHÔNG hỗ trợ nối chuỗi bằng `+` hay template interpolation `${...}`.
+
+**Quy tắc:**
+
+- Hỗ trợ `var` / `let` / `const`.
+- Hỗ trợ cả 3 loại dấu nháy: `"..."`, `'...'`, `` `...` `` (backtick dễ nhìn nhất khi HTML chứa cả `"` lẫn `'`).
+- Giá trị phải là **một string literal duy nhất** — KHÔNG hỗ trợ:
+  - Nối chuỗi bằng `+`
+  - Template interpolation `${...}`
+  - Gán chéo biến (`var A = B;` rồi dùng `A`)
+- Nếu khai báo trùng tên, **khai báo sau cùng** được dùng.
+- Không nên đặt tên biến trùng với key của manifest (`id`, `name`, `type`, `version`...).
+- Chỉ được dùng biến ở **vị trí giá trị** (sau dấu `:`), không dùng làm key.
+- `id` và `version` nên để literal (version có regex đọc riêng khi so sánh bản).
+
+---
+
+### 🌐 Domain Fallback — Tự Đổi Domain Khi Bị Chặn
+
+Khai báo `fallbackUrls` trong `getManifest()` để App tự chuyển sang domain khác khi domain chính bị chặn:
+
+```javascript
+function getManifest() {
+    return JSON.stringify({
+        id: "my_plugin",
+        name: "My Plugin",
+        baseUrl: "https://phim.com",
+        fallbackUrls: [
+            "https://phim2.com",
+            "https://phim3.net"
+        ]
+    });
+}
+```
+
+#### App xử lý thế nào?
+
+1. **Có cache domain còn hạn (10 phút)** → thử domain đó trước, timeout 5 giây.
+2. **Không có cache / cache hỏng** → **đua song song (race)** toàn bộ `baseUrl` + `fallbackUrls`, timeout tổng 8 giây. Domain nào trả về **nội dung dùng được đầu tiên** thì thắng và được cache 10 phút.
+3. **Tất cả đều fail** → App báo lỗi `"Không thể kết nối đến <tên plugin>"`.
+
+#### ✅ Thế nào là "nội dung dùng được"?
+
+App **không** chấp nhận mọi response khác rỗng nữa. Response bị **loại** nếu:
+- Rỗng, hoặc **ngắn hơn 32 ký tự**
+- 2048 ký tự đầu chứa dấu hiệu trang chặn: `just a moment`, `checking your browser`, `cf-browser-verification`, `access denied`, `403 forbidden`, `404 not found`, `ddos-guard`, `enable javascript and cookies to continue`…
+
+> ⚠️ **Lưu ý cho dev**: Nếu API của bạn trả về JSON hợp lệ nhưng **rất ngắn** (ví dụ `[]` hay `{"ok":1}` dưới 32 ký tự), domain đó sẽ bị coi là fail trong lúc race. Hãy đảm bảo endpoint dùng để race trả về nội dung có độ dài thực tế.
+
+#### 🔒 Đổi domain giữ nguyên path
+
+Khi đổi domain, App **giữ nguyên toàn bộ path/query/fragment**, và tự bỏ phần path riêng của `baseUrl` cũ:
+
+| `baseUrl` | URL plugin trả | Đổi sang | Kết quả |
+|-----------|----------------|----------|---------|
+| `https://a.com` | `https://a.com/phim/x?p=2` | `https://b.com` | `https://b.com/phim/x?p=2` |
+| `https://a.com/wp` | `https://a.com/wp/phim/x` | `https://b.com` | `https://b.com/phim/x` |
+| `https://a.com` | `https://a.com/x\|data:tok` | `https://b.com` | `https://b.com/x\|data:tok` |
+
+Phần `|data:...` luôn được giữ nguyên sau khi đổi domain.
+
+#### 👤 Người dùng đặt Base URL tùy chỉnh
+
+Nếu người dùng tự nhập Base URL trong màn hình Quản lý Plugin:
+- App **BỎ QUA hoàn toàn** cơ chế race domain — tôn trọng lựa chọn của người dùng.
+- Mọi URL do plugin sinh ra sẽ được thay `baseUrl` → domain người dùng chọn.
+- Khi người dùng đổi/xóa Base URL tùy chỉnh, cache domain **bị xóa ngay lập tức** (không phải chờ hết 10 phút).
+
+---
+
+**`adblock` option (Bật/Tắt chặn quảng cáo nền):**
+- **Không khai báo** (hoặc `true`): Mặc định **BẬT** bộ chặn quảng cáo nền cho plugin này.
+- **`false`**: **TẮT** bộ chặn quảng cáo mặc định cho plugin này.
+
+**`type` options:**
+| Giá trị | Loại nội dung & Trình phát |
+|---------|----------------------------|
+| `"MOVIE"` | Phim điện ảnh / Phim bộ truyền thống (Trình phát màn hình ngang) |
+| `"VIDEO"` | Video clip / Youtube (Bỏ qua màn hình Chi tiết, mở trình phát xem trực tiếp tương tự IPTV) |
+| `"shortfilm"` | Phim ngắn / Drama ngắn / Reels / Shortflix (Trình phát xoay đứng Portrait Zoom, hỗ trợ vuốt LÊN/XUỐNG chuyển tập kiểu TikTok trên Mobile) |
+| `"MANGA"` | Truyện tranh (Trình đọc manga) |
+| `"NOVEL"` | Truyện chữ |
+| `"IPTV"` | Truyền hình trực tiếp (Bỏ qua màn hình Chi tiết, phát thẳng kênh) |
+
+**`playerType` options:**
+| Giá trị | Khi nào dùng |
+|---------|-------------|
+| `"exoplayer"` | Khi bạn trích được link `.m3u8` / `.mp4` trực tiếp (khuyến nghị) |
+| `"embed"` | Khi chỉ có link iframe, bắt buộc hiển thị phát bằng WebView |
+| `"embedtoexoplay"` | Tải iframe qua WebView ngầm và chạy bộ dò mạng (Sniffer) để lấy link stream phát bằng ExoPlayer |
+| `"auto"` | App tự phán: URL chứa `.m3u8`/`.mp4` → ExoPlayer, còn lại → WebView |
+
+### Link Stream Trực Tiếp, MIME Và Header Player
+
+App nhận diện link media trực tiếp theo các dấu hiệu phổ biến: `.m3u8`, `.m3u9`, `.mpd`, `.mp4`, `.mkv`, `.vl`, `/get_file/` và `/get_video/`. Nhận diện này được dùng nhất quán khi mở phim, đổi tập và đổi server/chất lượng.
+
+Khi plugin đã lấy được link thật, nên trả rõ URL, MIME và các HTTP header cần thiết:
+
+```javascript
+function parseDetailResponse(html, pageUrl) {
+    return JSON.stringify({
+        url: "https://cdn.example.com/get_file/video.mp4",
+        isEmbed: false,
+        mimeType: "video/mp4",
+        headers: {
+            Referer: pageUrl || BASEURL + "/",
+            "User-Agent": "Mozilla/5.0 ..."
+        },
+        subtitles: []
+    });
+}
+```
+
+MIME thường dùng:
+
+| Stream | `mimeType` |
+|--------|------------|
+| MP4 progressive | `video/mp4` |
+| HLS / M3U8 | `application/x-mpegURL` |
+| MPEG-DASH / MPD | `application/dash+xml` |
+| MKV | `video/x-matroska` |
+
+Lưu ý về header:
+- `Referer`, `User-Agent`, cookie và header do plugin/sniffer trả về được chuyển riêng theo từng stream tới player.
+- Khi đổi tập/server/chất lượng, app tạo data source riêng cho lệnh mới để header không bị lẫn với stream trước.
+- Các header điều khiển nội bộ như `Custom-Js`, `Allowed-Domains`, `Block-Ads`, `Block-Redirects`, `Stream-Regex`, `Block-Scripts`, `Block-Css`, `Custom-Header` và `Bypass-Rule` chỉ dành cho WebView/sniffer; app lọc chúng trước khi gửi request media tới ExoPlayer.
+- CDN chặn hotlink thường cần `Referer` đúng trang nguồn. Nếu player buffering mãi, kiểm tra URL còn hạn, `Referer`, `User-Agent`, cookie và response HTTP trước.
+
+### Embed, WebView Và Custom-Js
+
+- `playerType: "embed"`: hiển thị trang/iframe bằng WebView.
+- `playerType: "embedtoexoplay"`: WebView/sniffer chạy trước để bắt link media, sau đó gửi URL + header đã bắt được sang ExoPlayer.
+- `Custom-Js` được thực thi trong luồng WebView/sniffer và không được gửi như HTTP header media.
+- Mỗi lần sniffer bắt được stream, URL và header của lần bắt đó được đóng gói riêng trước khi gửi player.
+- Nếu đã có URL trực tiếp, dùng `isEmbed: false` và MIME phù hợp thay vì ép qua WebView.
+
+---
+
+### ⏩ Tự Động Bỏ Qua Quảng Cáo (`skipTimes`) & Đồng Bộ Phụ Đề Bị Lệch (`timeOffset`)
+
+Nếu nguồn phim của bạn có chèn các đoạn quảng cáo (ví dụ 30s đầu phim, hoặc đoạn 2:00 -> 2:30), bạn có thể cấu hình để ExoPlayer **tự động nhảy qua các đoạn này** và **tự động đồng bộ lại mốc thời gian phụ đề**:
+
+#### 1. Cấu hình `skipTimes` trong hàm `getStreamLink` hoặc `parseDetailResponse`
+
+Trả về mảng `skipTimes` chứa các khoảng thời gian cần tự động tua qua (tính bằng giây):
+
+```javascript
+function getStreamLink(episodeId, datasend) {
+    return JSON.stringify({
+        url: "https://domain.com/video.m3u8",
+        headers: { "Referer": "https://domain.com/" },
+
+        // ⏩ Danh sách các đoạn tự động nhảy qua (tính bằng giây)
+        skipTimes: [
+            { start: 0, end: 30, type: "ad" },      // Bỏ qua 30s quảng cáo đầu (0:00 -> 0:30)
+            { start: 120, end: 150, type: "ad" }    // Bỏ qua 30s quảng cáo ở phút 2:00 -> 2:30
+        ],
+
+        subtitles: [
+            {
+                lang: "Vietsub (Đã bù 30s QC)",
+                url: "https://sub.com/vi.vtt",
+                // ⏱️ timeOffset: Dời mốc thời gian phụ đề (tính bằng giây) để khớp với video bị chèn QC
+                timeOffset: 30
+            }
+        ]
+    });
+}
+```
+
+- **Khi mở phim từ đầu (`00:00`)**: Nếu có đoạn skip từ `0s -> 30s`, Player sẽ tự động bắt đầu phát ngay từ giây thứ 30.
+- **Trong quá trình xem**: Khi thời gian phát chạm mốc `start`, Player tự động seek đến mốc `end`.
+- **Phụ đề (`timeOffset`)**: App sẽ tự động dịch chuyển toàn bộ timestamp trong file phụ đề SRT/WebVTT tương ứng theo số giây offset để khớp 100% với video stream.
+- **Tùy chỉnh Subtitle Delay trên Player**: Người dùng cũng có thể tự do chỉnh nhanh độ trễ `[-5s]`, `[-1s]`, `[-0.5s]`, `[0s]`, `[+0.5s]`, `[+1s]`, `[+5s]`, `[+30s]` trực tiếp trong menu Cài đặt phụ đề trên cả Mobile và TV.
+
+---
+
+### `parseListResponse()` — Danh sách phim & Thư mục lồng nhau
+
+```json
+{
+    "items": [
+        {
+            "id": "slug-phim-hoac-slug-danh-muc",
+            "title": "Tên Phim hoặc Tên Diễn Viên / Thể Loại",
+            "posterUrl": "https://img.../poster.jpg",
+            "backdropUrl": "https://img.../backdrop.jpg",
+            "description": "Mô tả ngắn hoặc thời lượng",
+            "year": 2024,
+            "quality": "FHD",
+            "episode_current": "Tập 10/12",
+            "lang": "Vietsub",
+            "previewUrl": "https://.../preview.mp4"
+        }
+    ],
+    "pagination": {
+        "currentPage": 1,
+        "totalPages": 5,
+        "totalItems": 100,
+        "itemsPerPage": 20
+    }
+}
+```
+
+---
+
+#### 📁 Cơ Chế Tuyển Tập & Thư Mục Lồng Nhau Đa Cấp (Nested Collections & Hierarchical Folders)
+
+App hỗ trợ tính năng **Thư mục / Tuyển tập lồng nhau đa tầng (N-Level Drill-down)** bắt đầu từ **Trang chủ (Home)**, **Tìm kiếm (Search)** cho đến các màn hình danh sách (`CategoryScreen`):
+
+##### 🎯 Trường Hợp Sử Dụng Điển Hình:
+- **Tầng 1 (Trang chủ Home)**: Xuất hiện thẻ *"Tuyển tập Doraemon"* (có ảnh poster riêng của bộ sưu tập).
+- **Tầng 2 (Bấm vào Tuyển tập Doraemon)**: App mở danh sách các thư mục con:
+  - *"Doraemon Phim Dài"* (`isCategory: true`)
+  - *"Doraemon Phim Ngắn"* (`isCategory: true`)
+  - *"Doraemon Bản Điện Ảnh 2026"* (`isCategory: true`)
+- **Tầng 3 (Bấm vào Doraemon Phim Dài)**: App mở danh sách các phim lẻ cụ thể:
+  - *"Doraemon: Nobita và Bản Giao Hưởng Địa Cầu"* (`isCategory: false` → Mở màn hình Chi Tiết Phim `DetailScreen`)
+  - *"Doraemon: Nobita và Cuộc Chiến Vũ Trụ Tí Hon"* (`isCategory: false` → Mở Chi Tiết Phim)
+- **Quay lại (Back)**: Người dùng bấm phím Back trên điện thoại hoặc bấm nút Back trên Remote TV sẽ **lùi từng cấp một** (Chi tiết → Doraemon Phim Dài → Tuyển tập Doraemon → Trang chủ) cực kỳ mượt mà!
+
+---
+
+#### 🛠️ Bảng Quy Ước Nhận Diện Thư Mục / Phim:
+
+App tự động nhận diện một item là **Tuyển tập / Thư mục** hay **Phim thường** dựa trên các trường sau:
+
+| Thuộc tính khai báo trong item | Ý nghĩa | Giao diện hiển thị | Hành vi khi Click |
+| :--- | :--- | :--- | :--- |
+| **`"isCategory": true`** hoặc **`"isFolder": true`** | Thư mục / Tuyển tập con | • Có `posterUrl`: **Lưới ảnh Poster** bộ sưu tập<br>• Không `posterUrl`: **Thẻ chữ màu** (Category Grid) | **Mở danh sách con**: App gọi `CategoryScreen` với slug `item.id` |
+| **`"type": "folder"`** / `"category"` / `"collection"` / `"actress"` | Thư mục / Tuyển tập / Diễn viên | Tương tự trên | **Mở danh sách con**: App gọi `CategoryScreen` với slug `item.id` |
+| **`"quality": "CAT"`** / `"FOLDER"` / `"ACTRESS"` | Chuẩn quy ước cũ (tương thích ngược) | Tương tự trên | **Mở danh sách con**: App gọi `CategoryScreen` với slug `item.id` |
+| **Không khai báo các trường trên** (hoặc `isCategory: false`) | Phim / Video cụ thể | **Poster phim tiêu chuẩn** | **Mở màn hình Chi tiết phim** (`DetailScreen` / `detail/{id}`) |
+
+> 💡 **Mẹo hiển thị**:
+> - Nếu bạn truyền `posterUrl`, App sẽ render thành **Thẻ ảnh Poster** sang trọng (rất phù hợp cho Tuyển tập như *Tuyển tập Doraemon*, *Vũ trụ Marvel*, *Tuyển tập Châu Tinh Trì*, *Diễn viên*).
+> - Nếu bạn **không truyền `posterUrl`** (hoặc để rỗng `""`), App sẽ tự động render thành **Thẻ chữ màu** (Category Grid ô màu), cực kỳ hợp cho danh mục thể loại thuần túy như *Hành động, Tình cảm, Kinh dị*!
+
+---
+
+#### 💡 Ví Dụ Mẫu Code Plugin Hoàn Chỉnh:
+
+```javascript
+// 1. Khai báo Section trên Trang chủ
+function getHomeSections() {
+    return JSON.stringify([
+        { slug: "home-tuyen-tap", title: "Bộ Sưu Tập & Tuyển Tập Hay", type: "Horizontal" },
+        { slug: "phim-moi", title: "Phim Mới Cập Nhật", type: "Horizontal" }
+    ]);
+}
+
+// 2. App gọi getUrlList để lấy dữ liệu cho Section hoặc cho Thư mục con
+function getUrlList(slug, filtersJson) {
+    var page = JSON.parse(filtersJson || "{}").page || 1;
+    // slug có thể là "home-tuyen-tap", hoặc "tuyen-tap-doraemon", hoặc "doraemon-phim-dai"
+    return "https://api.myweb.com/list/" + slug + "?page=" + page;
+}
+
+// 3. Xử lý phân cấp trong parseListResponse
+function parseListResponse(html, apiUrl, datasend) {
+    var items = [];
+
+    if (apiUrl.indexOf("home-tuyen-tap") !== -1) {
+        // CẤP 1 (TRANG CHỦ): Trả về các Bộ Sưu Tập Lớn
+        items.push({
+            id: "tuyen-tap-doraemon",
+            title: "Tuyển Tập Doraemon",
+            posterUrl: "https://img.myweb.com/doraemon-collection.jpg",
+            isFolder: true,             // ⭐ Bấm vào sẽ mở cấp 2
+            quality: "Tuyển tập 50+ phim" // Nhãn hiển thị nhỏ
+        });
+        items.push({
+            id: "vu-tru-marvel",
+            title: "Vũ Trụ Điện Ảnh Marvel (MCU)",
+            posterUrl: "https://img.myweb.com/marvel.jpg",
+            isCategory: true,           // ⭐ Bấm vào sẽ mở cấp 2
+            quality: "Phase 1 - Phase 5"
+        });
+    } else if (apiUrl.indexOf("tuyen-tap-doraemon") !== -1) {
+        // CẤP 2: Các nhóm con bên trong Doraemon
+        items.push({
+            id: "doraemon-phim-dai",
+            title: "Doraemon Phim Dài (Chiếu Rạp)",
+            posterUrl: "https://img.myweb.com/doraemon-movies.jpg",
+            isCategory: true,           // ⭐ Tiếp tục lồng cấp 3!
+            quality: "43 phim"
+        });
+        items.push({
+            id: "doraemon-phim-ngan",
+            title: "Doraemon Phim Ngắn",
+            posterUrl: "https://img.myweb.com/doraemon-short.jpg",
+            isCategory: true,           // ⭐ Tiếp tục lồng cấp 3!
+            quality: "25 tập"
+        });
+    } else if (apiUrl.indexOf("doraemon-phim-dai") !== -1) {
+        // CẤP 3: Danh sách các phim lẻ cụ thể
+        items.push({
+            id: "doraemon-ban-giao-huong-dia-cau",
+            title: "Doraemon: Bản Giao Hưởng Địa Cầu (2024)",
+            posterUrl: "https://img.myweb.com/giao-huong.jpg",
+            isCategory: false,          // ⭐ Phim cuối -> bấm vào mở màn hình Detail!
+            quality: "FHD",
+            year: 2024
+        });
+        items.push({
+            id: "doraemon-vung-dat-ly-tuong-bau-troi",
+            title: "Doraemon: Vùng Đất Lý Tưởng Trên Bầu Trời",
+            posterUrl: "https://img.myweb.com/bau-troi.jpg",
+            isCategory: false,          // ⭐ Mở màn hình Detail!
+            quality: "FHD",
+            year: 2023
+        });
+    }
+
+    return JSON.stringify({
+        items: items,
+        pagination: { currentPage: 1, totalPages: 1, totalItems: items.length, itemsPerPage: 20 }
+    });
+}
+```
+
+---
+
+##### 📺 Ví Dụ Thực Tế: Đặt Tuyển Tập Vào Hàng Ngang Danh Mục Trang Chủ (Ví dụ mục "Hoạt Hình POP")
+
+Giả sử trên Trang chủ bạn có các danh mục hàng ngang như **"Hoạt Hình POP"**, **"Nhạc Bolero"**, **"Phim"**:
+
+1. **Đặt Thẻ Tuyển tập ngay trong hàng ngang**:
+   - Bạn có thể đặt thẻ *"Thám Tử Lừng Danh Conan Trọn bộ lồng tiếng"* (hoặc *"Tuyển tập Doraemon"*) nằm chung hàng ngang với các phim/video khác.
+   - Chỉ cần thêm `"isFolder": true` (hoặc `"isCategory": true`), kèm thumbnail 16:9 và nhãn `"episode_current": "1061 Tập"`:
+     ```javascript
+     items.push({
+         id: "conan-tuyen-tap",
+         title: "Thám Tử Lừng Danh Conan Trọn bộ lồng tiếng",
+         posterUrl: "https://img.myweb.com/conan-thumb.jpg",
+         isFolder: true,              // ⭐ App nhận diện để bấm vào sẽ mở danh sách con
+         episode_current: "1061 Tập", // Nhãn số tập góc trên thẻ
+         quality: "HD"
+     });
+     ```
+   - Khi người dùng lướt ngang thấy thẻ này và bấm vào $\rightarrow$ App lập tức mở danh sách các phần/vụ án con của Conan thay vì mở thẳng màn hình xem!
+
+2. **Hành vi nút mũi tên đỏ `->` (Xem thêm) cạnh tiêu đề danh mục**:
+   - Khi người dùng bấm vào tiêu đề danh mục hoặc nút mũi tên `->` bên cạnh chữ **"Hoạt Hình POP"**, App sẽ mở màn hình danh mục đầy đủ (`CategoryScreen`).
+   - Tại đây, plugin có thể trả về danh sách gồm nhiều Tuyển tập lớn (Conan, Doraemon, Shin Cậu Bé Bút Chì, Naruto...). Bấm vào bất kỳ tuyển tập nào sẽ tiếp tục lồng sâu vào các phần/tập bên trong.
+
+---
+
+#### 💡 Cơ Chế Nhận Diện Trang Trong Plugin (Linh Hoạt & Không Bắt Buộc Từ Khóa Cố Định)
+
+> ⭐ **TỔNG KẾT CÁC CÁCH KHAI BÁO THƯ MỤC / TUYỂN TẬP:**
+> 1. **Dùng cờ Boolean**: `"isCategory": true` hoặc `"isFolder": true`
+> 2. **Dùng trường Type**: `"type": "folder"` / `"collection"` / `"category"` / `"genre"` / `"actress"` / `"actor"`
+> 3. **Không bắt buộc `posterUrl`**: Nếu là Thể loại ô chữ, bạn không cần truyền `posterUrl` (hoặc để rỗng `""`), App tự động render thành thẻ màu đẹp mắt!
+> 4. **Hỗ trợ nhãn phụ (Số lượng phim/Trạng thái)**: Bạn có thể tự do dùng `quality: "128 phim"` hoặc `episode_current: "128 phim"`, App sẽ hiện dòng chữ nhỏ này ngay dưới tên Thể loại!
+> 5. **Tương thích ngược 100%**: Cách cũ `quality: "CAT"` và `quality: "ACTRESS"` vẫn chạy bình thường.
+
+##### Cách 1: Nhận diện qua tham số `apiUrl` (Khuyên dùng & Đơn giản nhất)
+App luôn truyền URL đang fetch vào tham số thứ 2 của `parseListResponse(html, apiUrl, datasend)`:
+```javascript
+function parseListResponse(html, apiUrl, datasend) {
+    var items = [];
+
+    // Kiểm tra URL theo website của bạn (/dien-vien, /actors, /the-loai, /category, /tags,...)
+    var isActressPage = apiUrl.indexOf('/dien-vien') !== -1 || apiUrl.indexOf('/actors') !== -1;
+    var isGenrePage = apiUrl.indexOf('/the-loai') !== -1 || apiUrl.indexOf('/categories') !== -1;
+
+    if (isActressPage) {
+        // Parse danh sách Diễn viên
+        // Cách mới: type: "actress" (có poster ảnh đại diện)
+        items.push({
+            id: "/dien-vien/ninh-duong-lan-ngoc",
+            title: "Ninh Dương Lan Ngọc",
+            posterUrl: "https://.../avatar.jpg",
+            type: "actress" // Hoặc quality: "ACTRESS" (App sẽ mở tiếp danh sách phim khi click)
+        });
+    } else if (isGenrePage) {
+        // Parse danh sách Thể loại (Thẻ chữ màu CategoryGrid)
+        // Cách mới: isCategory: true (KHÔNG cần posterUrl, có thể kèm số lượng phim qua quality)
+        items.push({
+            id: "/the-loai/kinh-di",
+            title: "Kinh Dị",
+            isCategory: true,       // ⭐ Tường minh, chuẩn JSON (hoặc type: "category")
+            quality: "128 phim"    // Tùy chọn: hiện nhãn phụ nhỏ dưới tên thể loại
+        });
+    } else {
+        // Parse danh sách Phim bình thường
+        items.push({
+            id: "lat-mat-7",
+            title: "Lật Mặt 7",
+            posterUrl: "https://.../poster.jpg",
+            quality: "HD"           // Mở màn hình chi tiết phim khi click
+        });
+    }
+
+    return JSON.stringify({
+        items: items,
+        pagination: { currentPage: 1, totalPages: 10, totalItems: items.length, itemsPerPage: 20 }
+    });
+}
+```
+
+##### Cách 2: Gắn nhãn chủ động bằng `datasend` (Dấu Pipe `|`)
+Bạn có thể tự gắn nhãn cho các mục menu trong `getPrimaryCategories()`:
+```javascript
+function getPrimaryCategories() {
+    return JSON.stringify([
+        { name: 'Diễn viên', slug: 'danh-sach-dien-vien|data:type=actress' },
+        { name: 'Thể loại', slug: 'danh-sach-the-loai|data:type=genre' },
+        { name: 'Mới cập nhật', slug: 'phim-moi|data:type=movie' }
+    ]);
+}
+
+function parseListResponse(html, apiUrl, datasend) {
+    var items = [];
+    if (datasend === "type=actress") {
+        // Xử lý danh sách diễn viên -> type: "actress" (hoặc quality: "ACTRESS")
+    } else if (datasend === "type=genre") {
+        // Xử lý danh sách thể loại -> isCategory: true (hoặc type: "category", quality: "CAT")
+    } else {
+        // Xử lý danh sách phim thông thường -> quality: "HD"
+    }
+    return JSON.stringify({ items: items, pagination: { currentPage: 1, totalPages: 1 } });
+}
+```
+
+##### Cách 3: Nhận diện theo Class / Thẻ DOM đặc trưng của Website
+Nếu URL không có dấu hiệu phân biệt rõ ràng, hãy kiểm tra CSS class của website đó:
+```javascript
+var isActressPage = html.indexOf('class="actor-card"') !== -1 || html.indexOf('class="cast-list"') !== -1;
+var isGenrePage = html.indexOf('class="genre-box"') !== -1 || html.indexOf('class="category-items"') !== -1;
+```
+
+---
+
+### `parseMovieDetail()` — Chi tiết phim
+
+```json
+{
+    "id": "slug-phim",
+    "title": "Tên Phim",
+    "posterUrl": "https://...",
+    "backdropUrl": "https://...",
+    "description": "Nội dung phim...",
+    "servers": [
+        {
+            "name": "Server HD",
+            "episodes": [
+                {
+                    "id": "https://phim.com/xem/tap-1",
+                    "name": "Tập 1",
+                    "slug": "tap-1"
+                }
+            ]
+        }
+    ],
+    "quality": "FHD",
+    "year": 2024,
+    "rating": 8.5,
+    "casts": "[Diễn viên A](/dien-vien/a), [Diễn viên B](/dien-vien/b)",
+    "director": "Đạo diễn C",
+    "category": "[Hành Động](/the-loai/hanh-dong), [Phiêu Lưu](/the-loai/phieu-luu)",
+    "status": "Full",
+    "duration": "120 Phút",
+    "previewUrl": "https://.../preview.mp4"
+}
+```
+
+---
+
+#### 🔗 Định Dạng Liên Kết Markdown trong Trang Chi Tiết (`casts`, `category`, `director`, `status`)
+
+App hỗ trợ tự động bóc tách **Markdown Links** `[Tên Hiển Thị](slug_hoặc_url)` trong các trường thông tin:
+- **`casts`** (Diễn viên)
+- **`category`** (Thể loại)
+- **`director`** (Đạo diễn)
+- **`status`** (Trạng thái / Nhãn / Studio)
+
+##### Cách viết trong plugin:
+```javascript
+function parseMovieDetail(html, apiUrl, datasend) {
+    // ... bóc tách dữ liệu ...
+    return JSON.stringify({
+        id: "snos-056",
+        title: "Tên Phim",
+        posterUrl: "https://.../cover.jpg",
+        // Định dạng [Tên](slug_hoặc_path)
+        casts: "[Yua Mikami](/vi/actresses/yua-mikami), [Eimi Fukada](/vi/actresses/eimi-fukada)",
+        category: "[Không Che](/vi/genres/uncensored), [VR](/vi/genres/vr)",
+        director: "[Tên Đạo Diễn](/director/abc)",
+        servers: [ ... ]
+    });
+}
+```
+
+👉 **Lợi ích:** Trên giao diện Chi tiết phim của App, các mục này sẽ hiển thị dạng link gạch chân có màu. Khi người dùng **bấm vào tên Diễn viên hoặc Thể loại**, App sẽ tự động mở màn hình `CategoryScreen` tương ứng với slug đó!
+
+---
+
+**🔑 Về `episode.id`:**
+- Nếu là link `.m3u8`/`.mp4` trực tiếp → App phát luôn, KHÔNG gọi `parseDetailResponse`
+- Nếu là slug/URL khác → App gọi `getUrlDetail(episode.id)` → fetch → `parseDetailResponse(html, apiUrl)`
+- Muốn mang thêm token/key sang bước sau → ghép `"|data:" + token` vào `id` (xem [⚡ Quy Ước Dấu `|`](#-quy-ước-dấu--pipe--header-hay-data-của-plugin))
+- **Với Truyện tranh (Manga/Comic)**: Mỗi `episode` đại diện cho một Chương (Chapter). `id` là URL hoặc slug của chương, `name` là tên hiển thị (VD: `"Chương 1"`, `"Chap 105"`).
+
+**🔑 Về `episode.slug`:** Bắt buộc **DUY NHẤT** cho từng tập / từng chương (`tap-1`, `tap-2`, `chap-1`, `c100`…).
+- Với Phim: Cơ chế Preload của App dùng `slug` để xác định tập hiện tại và tải ngầm tập kế tiếp.
+- Với Truyện tranh: Cơ chế **Lưu vị trí trang ảnh đang đọc dở**, đánh dấu chương đã đọc và **Đọc nối tiếp không giới hạn** đều dựa vào `slug`. Nếu mọi chương đều dùng chung một slug (như `"full"`), App sẽ không thể khôi phục trang đọc dở và không thể nhảy chương chuẩn xác!
+
+---
+
+#### 📂 Cấu Trúc Lồng Server & Chất Lượng Trong Từng Tập (`ids`) ⭐ (Mới)
+
+Nếu nguồn phim có nhiều server hoặc nhiều chất lượng khác nhau cho cùng một tập (ví dụ: Season có 50 tập, mỗi tập lại có 3-4 nguồn phát/chất lượng 4K/1080p/720p), việc chia ra thành 4 Server riêng biệt bên ngoài sẽ làm danh sách tab bị rối.
+
+Bạn có thể lồng danh sách các nguồn phát trực tiếp vào mảng **`ids`** của từng tập:
+
+##### Cấu trúc JSON khai báo trong `parseMovieDetail()`:
+```json
+{
+    "id": "su-huynh-qua-can-trong",
+    "title": "Sư Huynh Quá Cẩn Trọng",
+    "posterUrl": "https://img.com/poster.jpg",
+    "servers": [
+        {
+            "name": "Nguồn Phim",
+            "episodes": [
+                {
+                    "name": "Tập 1",
+                    "slug": "tap-1",
+                    "id": "",
+                    "ids": [
+                        {
+                            "name": "Server VIP (4K)",
+                            "url": "https://server1.com/stream/tap-1-4k.m3u8",
+                            "datasend": ""
+                        },
+                        {
+                            "name": "Server Nhanh (1080p)",
+                            "url": "https://server2.com/stream/tap-1-1080p.m3u8",
+                            "datasend": ""
+                        },
+                        {
+                            "name": "Server Dự Phòng (720p)",
+                            "url": "https://server3.com/api/get-stream?ep=1",
+                            "datasend": "custom_token_if_needed"
+                        }
+                    ]
+                },
+                {
+                    "name": "Tập 2",
+                    "slug": "tap-2",
+                    "id": "https://server1.com/stream/tap-2.m3u8"
+                }
+            ]
+        }
+    ]
+}
+```
+
+##### 📱 Trải Nghiệm Trên App (Mobile & Android TV):
+1. **Khi tập có `ids` (nhiều hơn 1 nguồn)**:
+   - Khi người dùng bấm vào tập đó, App sẽ tự động hiển thị **Bảng chọn chất lượng & nguồn** (BottomSheet trên Mobile, Dialog điều hướng D-pad trên Android TV).
+   - Người dùng bấm chọn nguồn nào thì App sẽ phát ngay nguồn đó với đầy đủ URL & `datasend` tương ứng.
+2. **Khi tập có 1 nguồn hoặc chỉ có `id`**:
+   - App phát trực tiếp ngay lập tức mà không cần mở thêm bảng chọn.
+
+---
+
+### `parseDetailResponse()` — Lấy Link Video / Danh Sách Ảnh Truyện
+
+#### Trường hợp Truyện Tranh (Manga / Comic / Novel):
+**Cách 1: Trả về danh sách URL ảnh (Khuyên dùng - Native Compose Reader)**
+```json
+{
+    "images": [
+        "https://cdn.example.com/chap1/01.jpg",
+        "https://cdn.example.com/chap1/02.jpg",
+        "https://cdn.example.com/chap1/03.jpg"
+    ],
+    "headers": {
+        "Referer": "https://manhwa.example.com/",
+        "Origin": "https://manhwa.example.com"
+    },
+    "isEmbed": false
+}
+```
+> 💡 *App hỗ trợ linh hoạt các key ảnh:* `images`, `data`, `pages`, `chapter_images`, `items` (chứa mảng string URL hoặc mảng object `{url, src, image, link}`).
+
+**Cách 2: Trả về trang web đọc truyện nhúng (Embed WebView)**
+```json
+{
+    "url": "https://manhwa.example.com/chap-1-embed",
+    "isEmbed": true,
+    "headers": {
+        "Referer": "https://manhwa.example.com/"
+    }
+}
+```
+
+#### Trường hợp Phim đơn giản (link trực tiếp):
+```json
+{
+    "url": "https://cdn.example.com/video.m3u8",
+    "headers": {
+        "Referer": "https://phim.example.com"
+    },
+    "subtitles": [
+        { "lang": "vi", "url": "https://.../sub_vi.srt" }
+    ]
+}
+```
+
+#### Trường hợp embed (cần WebView):
+```json
+{
+    "url": "https://player.example.com/embed/abc123",
+    "headers": { "Referer": "https://phim.example.com" }
+}
+```
+
+#### Trường hợp nâng cao — Recursive Embed:
+```json
+{
+    "url": "https://site.com/ajax.php",
+    "isEmbed": true,
+    "postBody": "id=12345&sv=1",
+    "headers": {
+        "Referer": "https://site.com",
+        "X-Requested-With": "XMLHttpRequest"
+    }
+}
+```
+
+#### 💡 QUY TẮC XỬ LÝ ĐUÔI FILE KHÔNG CHUẨN (`.vl`, `.xyz`, `.stream`...) & MIME TYPE:
+Khi trang web sử dụng link stream có đuôi mở rộng lạ (ví dụ: luồng HLS m3u8 nhưng trang web đặt đuôi file là `.vl`, `.m3u`, `.xyz`, `.stream`...), Plugin **KHÔNG CẦN YÊU CẦU SỬA APP**, chỉ cần khai báo chuẩn 1 trong 2 cách sau:
+
+1. **Khai báo `mimeType` trực tiếp khi trả về link**:
+   ```json
+   {
+       "url": "https://play.vlstream.net/hls/video_sample.vl",
+       "isEmbed": false,
+       "mimeType": "application/x-mpegURL",
+       "headers": { "Referer": "https://play.vlstream.net/" }
+   }
+   ```
+   *Các kiểu `mimeType` phổ biến:*
+   - HLS m3u8 (kể cả bị đổi đuôi thành `.vl`, `.xyz`): `"application/x-mpegURL"`
+   - Video MP4: `"video/mp4"`
+   - DASH stream: `"application/dash+xml"`
+
+2. **Khai báo `Stream-Regex` khi dùng WebView ngầm (`isEmbed: true`)**:
+   ```json
+   {
+       "url": "https://embed.site.com/player/123",
+       "isEmbed": true,
+       "headers": {
+           "Stream-Regex": "https?:\\/\\/[^\"']+\\.(?:vl|m3u8|xyz)[^\"']*"
+       }
+   }
+   ```
+   #### 🔐 Khai báo DRM (ClearKey & Widevine DRM)
+Nếu luồng phát DASH (`.mpd`) yêu cầu mã hóa bản quyền DRM, plugin trả về các trường DRM tương ứng trong `parseDetailResponse`:
+
+1. **ClearKey DRM (Cần KID + KEY)**:
+```json
+{
+    "url": "https://example.com/manifest.mpd",
+    "isEmbed": false,
+    "mimeType": "application/dash+xml",
+    "drmType": "clearkey",
+    "drmKid": "aabbcc112233...",
+    "drmKey": "445566778899..."
+}
+```
+
+2. **Widevine DRM (Cần licenseUrl)**:
+```json
+{
+    "url": "https://s7485.cdn.mytvnet.vn/pkg20/__cl/gvtsig/vstv451/manifest.mpd",
+    "isEmbed": false,
+    "mimeType": "application/dash+xml",
+    "drmType": "widevine",
+    "licenseUrl": "https://tv.vietanhtv.top/mytv2/key.php"
+}
+```
+
+---
+
+### `parseEmbedResponse()` — Phân Tích Iframe Embed
+
+### 🎬 Chế Độ `embedtoexoplay` & EmbedSniffer (Nâng Cao)
+
+Khi plugin khai báo `"playerType": "embedtoexoplay"` trong `getManifest()`, ứng dụng sẽ dùng **EmbedSniffer** (WebView chạy ngầm với màn hình Loading đen che bên trên) để tải trang web embed, tự động dò tìm link stream (.m3u8, .mp4, ...) và chuyển cho ExoPlayer phát native. Người dùng sẽ không nhìn thấy giao diện thô hay quảng cáo của trang web embed.
+
+| Header Key | Mục đích | Ví dụ |
+|------------|----------|-------|
+| `Block-Ads` | Khóa điều khiển chặn quảng cáo Custom riêng cho link này. Nếu Manifest để `adblock: false`, bạn truyền `"Block-Ads": "true"` kết hợp với `Block-Domains`/`Block-Keywords` để CHỈ chặn các domain tùy biến do plugin chỉ định (TÁCH BẠCH, KHÔNG chặn 58+ domain mặc định của App). | `"true"` hoặc `"false"` |
+| `Block-Redirects` | Bật/Tắt chặn chuyển hướng main frame khi click (`"true"` = bật chặn, `"false"` = cho phép). Mặc định `"true"` khi `Block-Ads: true`. | `"true"` hoặc `"false"` |
+| `Block-Domains` | Danh sách tên miền quảng cáo bổ sung do Plugin tự định nghĩa (phân cách bằng dấu phẩy) | `"bad-domain.com, ad-server.net"` |
+| `Block-Keywords` | Danh sách từ khóa URL quảng cáo bổ sung do Plugin tự định nghĩa (phân cách bằng dấu phẩy) | `"/popunder, /popup.js"` |
+| `Block-Css` | Chuỗi CSS Selectors bổ sung do Plugin tự định nghĩa để ẩn các phần tử/thẻ div quảng cáo cụ thể | `".my-ad-banner, #popunder-layer, div[class*='custom-ad']"` |
+| `Block-Scripts` | Danh sách từ khóa/mẫu đường dẫn script cần chặn trong WebView (phân cách bằng dấu phẩy) | `"adsterra,popads,clickadu"` |
+| `Custom-Js` | Chuỗi JavaScript được inject vào WebView **ngay khi bắt đầu tải trang** (`onPageStarted` — trước khi script của web gốc chạy). Có thể chủ động trích xuất link và gọi `SnifferBridge.play(url, headers)` | `"(function() { SnifferBridge.play(url); })();"` |
+| `Stream-Regex` | Chuỗi RegEx tùy chỉnh để EmbedSniffer lọc bắt link mạng thay cho mẫu mặc định (.m3u8, .mp4...) | `"https?:\\/\\/[^\"'\\s]+\\/index\\.m3u8"` |
+| `User-Agent` | Đặt User-Agent cho WebView | `"Mozilla/5.0 ..."` |
+| `Referer` | Đặt Referer cho WebView | `"https://site.com/"` |
+
+#### 🛠️ Hàm Hỗ Trợ trong `Custom-Js` (`SnifferBridge`):
+Trong mã `Custom-Js`, plugin có thể gọi các hàm Bridge sau:
+- `SnifferBridge.play(streamUrl, headersJson)` / `playVideo(...)` / `sendToPlayer(...)`: Truyền trực tiếp link stream tìm được cho ExoPlayer.
+- `SnifferBridge.toast(message)`: Hiển thị Toast thông báo nhanh (mặc định 2 giây).
+- `SnifferBridge.toast(message, timerMs)`: Hiển thị Toast với thời gian tùy chỉnh (`timerMs` tính bằng miligiây, ví dụ `5000` = 5 giây).
+- `SnifferBridge.log(message)`: Ghi log ra tab Console nổi của App.
+
+> ℹ️ **LƯU Ý VỀ ANTI-AD CSS TỰ ĐỘNG:**
+> Khi `Block-Ads: true`, App đã tự động áp dụng bộ quy tắc CSS tổng quát để diệt toàn bộ thẻ `div`, `iframe`, `a`, `popunder` quảng cáo:
+> ```css
+> iframe[src*="ad"], iframe[src*="pop"], iframe[src*="banner"],
+> div[class*="ad-"], div[class*="ad_"], div[id*="ad-"], div[id*="ad_"],
+> div[class*="banner"], div[id*="banner"], div[class*="popup"], div[id*="popup"],
+> div[class*="popunder"], div[id*="popunder"],
+> div[style*="z-index: 2147483647"]:not(.jw-controls):not(.plyr__controls),
+> div[style*="z-index: 999999"]:not(.jw-controls):not(.plyr__controls),
+> a[href*="bet"], a[href*="casino"], a[href*="click"],
+> .popunder, .popup, .ad-box, .ad-container, .adsbygoogle
+> ```
+> Dev Plugin chỉ cần khai báo thêm thuộc tính `Block-Css` nếu trang web đó sử dụng class/id quảng cáo đặc thù.
+
+---
+
+### 🌉 Danh Sách Các Hàm Native JS Bridge (`SnifferBridge`)
+
+Khi viết `Custom-Js` hoặc mã xử lý trong WebView, plugin có thể sử dụng các hàm Native của **`SnifferBridge`** để chủ động truyền link stream và Header cho ExoPlayer phát:
+
+| Hàm Native | Tham số | Mô tả |
+|------------|---------|-------|
+| `SnifferBridge.play(url)` | `url`: String | Truyền link stream trực tiếp cho ExoPlayer phát |
+| `SnifferBridge.play(url, headersJson)` | `url`: String, `headersJson`: JSON String | Truyền link stream kèm Header tùy chỉnh (ví dụ: `Referer`, `User-Agent`) |
+| `SnifferBridge.playM3u8Content(m3u8Content, baseUrl)` | `m3u8Content`: String, `baseUrl`: String | ⚡ **Giải mã & Phát Blob M3U8 tại Local (127.0.0.1)**. Tự động chuẩn hóa đường dẫn tương đối và phát qua ExoPlayer không qua server trung gian |
+| `SnifferBridge.playM3u8Content(m3u8Content, baseUrl, headersJson)` | Thêm `headersJson`: String | Giống `playM3u8Content()` nhưng đính kèm thêm Header cho ExoPlayer |
+| `SnifferBridge.playVideo(url, headersJson)` | Bí danh | Giống `play()` |
+| `SnifferBridge.playExoPlayer(url, headersJson)` | Bí danh | Giống `play()` |
+| `SnifferBridge.sendToPlayer(url, headersJson)` | Bí danh | Giống `play()` |
+| `SnifferBridge.toast(message)` | `message`: String | 💡 **Hiển thị thông báo Toast nổi trên màn hình App** (Rất hữu ích khi debug WebView ngầm/embed) |
+| `SnifferBridge.log(message)` | `message`: String | 📝 **Ghi log debug ra Android Logcat** (Tag: `SnifferBridgeJS`) |
+| `SnifferBridge.onVideoDetected(url)` | `url`: String | Hàm callback cũ (tương thích ngược) |
+
+#### ⚡ Hướng Dẫn Bắt & Giải Mã Blob M3U8 Trực Tiếp Tại Local (Không Dùng Worker/GAS)
+
+Đối với các trang web phim sử dụng kỹ thuật giấu link stream bằng cách đọc file M3U8 và tạo Blob URL trong bộ nhớ RAM trình duyệt (`URL.createObjectURL`), bạn không cần gửi dữ liệu thô lên Cloudflare Worker hay Google Apps Script nữa. 
+
+Trong mã `Custom-Js`, bạn chỉ cần hook `URL.createObjectURL` và truyền nội dung M3U8 thô về cho App bằng `SnifferBridge.playM3u8Content(...)`:
+
+```javascript
+(function initBlobSniffer() {
+  if (typeof URL !== 'undefined' && URL.createObjectURL) {
+    var originalCreateObjectURL = URL.createObjectURL;
+    URL.createObjectURL = function(blob) {
+      var blobUrl = originalCreateObjectURL.apply(this, arguments);
+      if (blob && (blob instanceof Blob || blob instanceof File)) {
+        var processContent = function(content) {
+          if (content && content.trim().indexOf('#EXTM3U') === 0) {
+            // Gửi trực tiếp nội dung M3U8 thô và URL trang hiện tại về App
+            if (window.SnifferBridge && typeof window.SnifferBridge.playM3u8Content === 'function') {
+              window.SnifferBridge.playM3u8Content(content, window.location.href);
+            }
+          }
+        };
+
+        if (typeof blob.text === 'function') {
+          blob.text().then(processContent).catch(function(){});
+        } else {
+          var reader = new FileReader();
+          reader.onload = function(e) { processContent(e.target.result); };
+          reader.readAsText(blob);
+        }
+      }
+      return blobUrl;
+    };
+  }
+})();
+```
+
+👉 **Cơ chế xử lý tự động trong App Android:**
+1. App sẽ tự động quét và chuyển hóa tất cả các đường dẫn phân đoạn tương đối trong M3U8 (ví dụ: `segment_01.ts`, `key.key`) thành đường dẫn tuyệt đối (`https://domain-goc.com/path/segment_01.ts`).
+2. App khởi tạo một **Local HTTP Server** ngầm trên `127.0.0.1` của thiết bị và chuyển URL local cho ExoPlayer phát ngay lập tức với độ trễ ~0ms.
+
+### 🛠️ Hướng Dẫn Debug Log, Hàm `print()` & Khung Console Nổi (Dành Cho Dev Plugin Local)
+
+Dành riêng cho các **Plugin cài đặt trực tiếp từ file `.js` qua nút dấu (`+`)** trong màn hình Quản lý Plugin:
+
+#### 1. Trong hàm xử lý dữ liệu của file JS (Engine QuickJS):
+*(Các hàm `parseDetailResponse`, `parseListResponse`, `parseSearchResponse`...)*
+Bạn có thể in bất kỳ giá trị, biến, JSON object hoặc lỗi nào trực tiếp bằng cách gọi `print(...)` hoặc `console.log(...)`:
+```javascript
+// In dữ liệu hoặc JSON Object
+print("Dữ liệu bóc tách được:", result);
+print("Link stream:", streamUrl);
+
+// Hoặc dùng console.log chuẩn
+console.log("Chiều dài HTML:", html.length);
+```
+
+#### 🛠️ Hỗ trợ `localStorage` sẵn trong QuickJS Engine:
+- Bạn có thể sử dụng các hàm `localStorage.getItem(key)`, `localStorage.setItem(key, value)`, `localStorage.removeItem(key)` trực tiếp trong file JS mà không lo bị lỗi `ReferenceError: localStorage is not defined`.
+
+#### 2. Trong mã `Custom-Js` chèn vào WebView (`embedtoexoplay`):
+*(Đoạn JS chạy ngầm bên trong WebView)*
+Gửi log trực tiếp từ WebView về Khung Console Nổi bằng `SnifferBridge.log(...)` hoặc `SnifferBridge.toast(...)`:
+```javascript
+(function() {
+    try {
+        var video = document.querySelector('video');
+        if (video && video.src) {
+            // In log ra Khung Console Nổi
+            if (window.SnifferBridge) window.SnifferBridge.log("Đã bắt được link video: " + video.src);
+            // Truyền link cho ExoPlayer phát
+            if (window.SnifferBridge) window.SnifferBridge.play(video.src);
+        } else {
+            if (window.SnifferBridge) window.SnifferBridge.log("Đang chờ thẻ video xuất hiện...");
+        }
+    } catch (err) {
+        // In lỗi nếu bị crash script trong WebView
+        if (window.SnifferBridge) window.SnifferBridge.log("Lỗi CustomJS: " + err.message);
+    }
+})();
+```
+
+#### 3. Khung Nổi Toast Console (Có thể Sao Chép 1 Động Tác 📋):
+- Khi bạn chạy bất kỳ hàm nào của plugin local cài từ nút `+`, App sẽ **tự động bật một Khung Nổi Console (Toast Console Overlay)** đè lên góc dưới màn hình.
+- Khung này hiển thị thời gian, loại log (`[PRINT]`, `[LOG]`, `[ERROR]`, `[TOAST]`) và nội dung chi tiết.
+- Trên thanh công cụ của Khung Nổi có **Nút Sao Chép (📋)**: Chỉ cần bấm 1 phát là **toàn bộ dữ liệu log/lỗi được chép vào Clipboard** để bạn dán sang chỗ khác kiểm tra cực kỳ nhanh chóng mà không cần mở Chrome DevTools hay máy tính!
+- **Lỗi Cú Pháp & Exception Tự Động**: Nếu mã JS hoặc `Custom-Js` bị lỗi cú pháp (`SyntaxError`) hay exception, App sẽ tự động hiển thị dòng màu đỏ `[ERROR]` kèm chi tiết lỗi lên Khung Nổi ngay lập tức!
+
+---
+
+#### Ví dụ ĐẦY ĐỦ VỚI TOÀN BỘ DANH SÁCH TÊN MIỀN, KEYWORD & CSS SELECTORS:
+```javascript
+function parseDetailResponse(html, url) {
+    var customJsCode = `(function() {
+        if (window._vaapp_custom) return;
+        window._vaapp_custom = true;
+        
+        var v = document.querySelector('video');
+        if (v && v.src && v.src.indexOf('http') === 0) {
+            var headers = JSON.stringify({
+                "Referer": "https://embed18.streamc.xyz/",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
+            });
+            SnifferBridge.play(v.src, headers);
+        }
+    })();`;
+
+    return JSON.stringify({
+        "url": "https://embed18.streamc.xyz/embed.php?hash=c9e5230c3e65847df88fc05ea66cbbb6",
+        "isEmbed": true,
+        "headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://embed18.streamc.xyz",
+            
+            // 🛡️ 1. BẬT BỘ CHẶN QUẢNG CÁO TỔNG THỂ
+            "Block-Ads": "true",
+
+            // 🛑 2. BẬT CHẶN CHUYỂN HƯỚNG MAIN FRAME KHI CLICK
+            "Block-Redirects": "true",
+
+            // 🌐 3. CHẶN MẠNG CẤP THẤP: TOÀN BỘ TÊN MIỀN QUẢNG CÁO / CASINO / BETTING (Nối dài bằng dấu phẩy)
+            "Block-Domains": "googlesyndication.com, doubleclick.net, googleadservices.com, adnxs.com, imasdk.googleapis.com, popads.net, popcash.net, propellerads.com, exoclick.com, acscdn.com, attirecideryeah.com, trafficjunky.com, juicyads.com, bidvertiser.com, clickadu.com, pubmatic.com, rubiconproject.com, openx.net, casalemedia.com, smartadserver.com, criteo.com, taboola.com, outbrain.com, adroll.com, scorecardresearch.com, zedo.com, adstir.com, popmyads.com, adsterra.com, hilltopads.com, monetag.com, a-ads.com, clksite.com, ad-delivery.net, ad-maven.com, yandex.ru/ads, vidoomy.com, targetfirst.com, betting, casino, gamead, adtrace, adform, adservice, adsystem, adtech, adthrive, adtrqt, adzerk, amazon-adsystem, applovin, unity3d.com/ads, chartboost, inmobi, fyber, tapjoy, vungle, adcolony, mopub",
+
+            // 🔍 4. CHẶN KEYWORD URL SCRIPT QUẢNG CÁO / VAST XML / POPUP
+            "Block-Keywords": "/adserv/, /adstream/, /popunder, /popup.js, /ads.js, ad_provider, pop_under, pop_up, vast.xml, vpaid.js, ads/vpaid, bidder, tracking.js, analytics.js, banner.js, adserver, ad_script, ad_loader",
+
+            // 🧹 5. ANTI-AD CSS: ẨN TOÀN BỘ THẺ DIV, IFRAME, POPUP, BANNER VÀ VỚI LỚP PHỦ Z-INDEX CỦA WEB NÀY
+            "Block-Css": "iframe[src*='ad'], iframe[src*='pop'], iframe[src*='banner'], div[class*='ad-'], div[class*='ad_'], div[id*='ad-'], div[id*='ad_'], div[class*='banner'], div[id*='banner'], div[class*='popup'], div[id*='popup'], div[class*='popunder'], div[id*='popunder'], div[style*='z-index: 2147483647']:not(.jw-controls):not(.plyr__controls), div[style*='z-index: 999999']:not(.jw-controls):not(.plyr__controls), a[href*='bet'], a[href*='casino'], a[href*='click'], .popunder, .popup, .ad-box, .ad-container, .adsbygoogle",
+
+            // 🚫 6. CHẶN SCRIPT RIÊNG DO DEV CHỈ ĐỊNH
+            "Block-Scripts": "popads,exoclick,adsterra,clickadu",
+
+            "Custom-Js": customJsCode
+        }
+    });
+}
+```
+
+> ⚠️ **LƯU Ý QUAN TRỌNG VỀ `Custom-Js`:**
+> 1. `Custom-Js` được tự động chèn **sớm ở `onPageStarted`** (trước khi các đoạn script HTML của trang web gốc được thực thi). Nếu script của bạn muốn đợi DOM tải xong, hãy dùng `document.addEventListener("DOMContentLoaded", ...)` hoặc `if (document.readyState === "loading")`.
+> 2. `Custom-Js` trong `headers` phải là một **chuỗi dạng String** chứa mã JS. KHÔNG viết IIFE trực tiếp bên ngoài hàm `parseDetailResponse` vì engine QuickJS trên Android app sẽ bị crash do không có đối tượng `window`.
+> 3. `SnifferBridge.play(url, headersJson)` là hàm Bridge native của App. Ngay khi được gọi, WebView ngầm sẽ lập tức đóng lại và ExoPlayer sẽ nhận link stream để phát.
+
+#### Ví dụ 2: Lọc link theo `Stream-Regex` tùy chỉnh & Bật AdBlock
+```javascript
+function parseDetailResponse(html, url) {
+    return JSON.stringify({
+        "url": "https://gamomephim.com/embed/123",
+        "isEmbed": true,
+        "headers": {
+            "Block-Ads": "true",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "https://gamomephim.com/",
+            "Stream-Regex": "https?:\\/\\/[^\"'\\s]+\\/hls\\/[^\"'\\s]+\\.m3u8"
+        }
+    });
+}
+```
+
+---
+
+### `parseEmbedResponse(html, url)` — Xử lý embed nhiều bước
+
+Hàm này **chỉ cần viết** khi trang của bạn dùng luồng phức tạp (AJAX → iframe → stream). App gọi hàm này trong vòng lặp.
+
+```javascript
+function parseEmbedResponse(html, sourceUrl) {
+    // Bước trung gian: HTML chứa iframe → trích URL iframe
+    var iframeMatch = html.match(/src="(https?:\/\/[^"]+)"/);
+    if (iframeMatch) {
+        return JSON.stringify({
+            url: iframeMatch[1],
+            isEmbed: true,    // ← true = App sẽ fetch tiếp URL này
+            headers: { "Referer": "https://site.com/" }
+        });
+    }
+    
+    // Bước cuối: trích direct stream
+    var fileMatch = html.match(/"file"\s*:\s*"(https?[^"]+)"/);
+    if (fileMatch) {
+        return JSON.stringify({
+            url: fileMatch[1],
+            isEmbed: false,   // ← false = URL cuối cùng, phát luôn
+            mimeType: "application/x-mpegURL",
+            headers: { "Referer": "https://embed-server.com/" }
+        });
+    }
+    
+    // Không tìm thấy → dừng loop
+    return JSON.stringify({ url: "", isEmbed: false });
+}
+```
+
+**Quy tắc:**
+- `isEmbed: true` → App fetch URL đó rồi gọi lại `parseEmbedResponse()` (tối đa 3 lần)
+- `isEmbed: false` → URL cuối cùng, App phát bằng ExoPlayer
+- `url: ""` → Dừng lặp, App báo lỗi
+
+---
+
+### Trường `mimeType` — Khi file extension không chuẩn
+
+ExoPlayer nhận dạng stream qua extension (`.m3u8` → HLS, `.mp4` → Progressive). Nhưng nếu server dùng extension lạ (`.vl`, `.xyz`, `.dat`...), plugin cần chỉ định `mimeType`:
+
+```json
+{
+    "url": "https://cdn.example.com/03105.vl",
+    "mimeType": "application/x-mpegURL"
+}
+```
+
+| `mimeType` | Loại stream |
+|------------|------------|
+| `"application/x-mpegURL"` | HLS (m3u8 content) |
+| `"video/mp4"` | MP4 |
+| `""` hoặc không khai | App tự nhận dạng |
+
+> **Lợi ích**: Nếu sau này server đổi extension từ `.vl` → `.xyz`, bạn chỉ sửa plugin JS, KHÔNG cần build lại App. Tất cả do plugin quyết định.
+
+---
+
+### 📝 Hướng Dẫn Cấu Hình Phụ Đề (Subtitles)
+
+Plugin có thể cung cấp danh sách phụ đề cho ExoPlayer thông qua trường `subtitles` trong `parseDetailResponse()`.
+
+#### Cấu trúc trả về trong `parseDetailResponse()`:
+```javascript
+return JSON.stringify({
+    "url": "https://cdn.example.com/video.m3u8",
+    "headers": { "Referer": "https://example.com" },
+    "subtitles": [
+        {
+            "lang": "Tiếng Việt (Vietsub)", // Tên hiển thị trên menu phụ đề của App
+            "url": "https://cdn.example.com/sub/vietnamese.vtt" // Link WebVTT (.vtt), SubRip (.srt), hoặc ASS (.ass)
+        },
+        {
+            "lang": "English",
+            "url": "https://cdn.example.com/sub/english.vtt"
+        }
+    ]
+});
+```
+
+#### Quy tắc xử lý phụ đề trong App:
+1. **Định dạng hỗ trợ**: App hỗ trợ các file phụ đề chuẩn WebVTT (`.vtt`), SRT (`.srt`), ASS/SSA (`.ass`). App tự động bóc tách loại bỏ query string `?token=...` để nhận diện đúng định dạng.
+2. **Tên hiển thị (`lang`)**: App sẽ lấy trực tiếp chuỗi trong `lang` để làm nhãn trên giao diện menu phụ đề. Nên đặt tên ngắn gọn, rõ ràng (ví dụ: `"Tiếng Việt (Bản chuẩn)"`, `"English"`).
+3. **Cơ chế tương tác với SubtitleCat**:
+   - Nếu plugin đã khai báo phụ đề Tiếng Việt (chuỗi `lang` chứa chữ `"Việt"` hoặc `"Vietnamese"`), App sẽ **tự động bỏ qua SubtitleCat** và ưu tiên phát phụ đề từ plugin của bạn.
+   - Để tắt hoàn toàn tính năng tự động tìm phụ đề ngoài SubtitleCat cho plugin, bạn chỉ cần đặt `"subtitleCat": false` trong `getManifest()`.
+
+---
+
+## 📺 Cấu Hình Đặc Thù Cho Plugin IPTV & Mã Hóa DRM (ClearKey / Widevine)
+
+### 📑 Mục Lục Phần Này
+- [1. Đặc điểm của Plugin IPTV trong App](#1-đặc-điểm-của-plugin-iptv-trong-app)
+- [2. Khai báo Manifest cho IPTV](#2-khai-báo-manifest-cho-iptv)
+- [3. Luồng phát Kênh trực tiếp HLS (.m3u8) / MP4](#3-luồng-phát-kênh-trực-tiếp-hls-m3u8--mp4)
+- [4. Cấu hình ClearKey DRM (DASH .mpd kèm KID + KEY)](#4-cấu-hình-clearkey-drm-dash-mpd-kèm-kid--key)
+- [5. Cấu hình Widevine DRM (DASH .mpd kèm License URL)](#5-cấu-hình-widevine-drm-dash-mpd-kèm-license-url)
+- [6. Giải Mã M3U8 AES-GCM Tự Động (`m3u8Key` / `X-M3u8-Key`)](#6-giải-mã-m3u8-aes-gcm-tự-động-m3u8key--x-m3u8-key)
+
+---
+
+### <a id="1-đặc-điểm-của-plugin-iptv-trong-app"></a>1. Đặc điểm của Plugin IPTV trong App:
+- Khi người dùng bấm chọn kênh từ danh sách, App sẽ **bỏ qua giao diện chi tiết (Detail Screen)** và giải mã link stream để **phát trực tiếp ngay lập tức** bằng ExoPlayer.
+- Hỗ trợ đầy đủ các nguồn trực tiếp: HLS (`.m3u8`), DASH (`.mpd`), MP4, **ClearKey DRM**, **Widevine DRM**, và giải mã **M3U8 AES-GCM**.
+
+---
+
+### <a id="2-khai-báo-manifest-cho-iptv"></a>2. Khai báo Manifest cho IPTV:
+```javascript
+function getManifest() {
+    return JSON.stringify({
+        "id": "onsports_tv",
+        "name": "Kênh Truyền Hình Thể Thao",
+        "version": "1.0.0",
+        "baseUrl": "https://onsports.vn",
+        "type": "IPTV",             // ⭐ Bắt buộc: Đánh dấu plugin loại IPTV
+        "playerType": "exoplayer"   // Khuyến nghị dùng exoplayer
+    });
+}
+```
+
+---
+
+### <a id="3-luồng-phát-kênh-trực-tiếp-hls-m3u8--mp4"></a>3. Luồng phát Kênh trực tiếp HLS (.m3u8) / MP4:
+Trả về luồng trong `parseDetailResponse()`:
+```javascript
+function parseDetailResponse(html, url) {
+    return JSON.stringify({
+        "url": "https://live.example.com/vtvcab1/index.m3u8",
+        "mimeType": "application/x-mpegURL",
+        "headers": {
+            "User-Agent": "Mozilla/5.0 ...",
+            "Referer": "https://example.com/"
+        }
+    });
+}
+```
+
+---
+
+### <a id="4-cấu-hình-clearkey-drm-dash-mpd-kèm-kid--key"></a>4. Cấu hình ClearKey DRM (DASH .mpd kèm KID + KEY):
+Dành cho các luồng DASH yêu cầu giải mã bản quyền ClearKey DRM:
+```javascript
+function parseDetailResponse(html, url) {
+    return JSON.stringify({
+        "url": "https://live.example.com/channel/manifest.mpd",
+        "mimeType": "application/dash+xml",
+        "drmType": "clearkey",
+        "drmKid": "c410ddc6a75244639fd0561fba5ef19b",
+        "drmKey": "30d13ea42031b9ff8271e5dc37d90e10",
+        "headers": {
+            "User-Agent": "Mozilla/5.0 ...",
+            "Referer": "https://example.com/"
+        }
+    });
+}
+```
+
+---
+
+### <a id="5-cấu-hình-widevine-drm-dash-mpd-kèm-license-url"></a>5. Cấu hình Widevine DRM (DASH .mpd kèm License URL):
+Dành cho các kênh truyền hình bảo vệ bởi Widevine DRM:
+```javascript
+function parseDetailResponse(html, url) {
+    return JSON.stringify({
+        "url": "https://s7485.cdn.mytvnet.vn/pkg20/__cl/gvtsig/vstv451/manifest.mpd",
+        "mimeType": "application/dash+xml",
+        "drmType": "widevine",
+        "licenseUrl": "https://tv.vietanhtv.top/mytv2/key.php",
+        "drmHeaders": {
+            "User-Agent": "Dalvik/2.1.0 (Linux; U; Android...)"
+        }
+    });
+}
+```
+
+---
+
+### <a id="6-giải-mã-m3u8-aes-gcm-tự-động-m3u8key--x-m3u8-key"></a>6. Giải Mã M3U8 AES-GCM Tự Động (`m3u8Key` / `X-M3u8-Key`):
+
+Đối với các luồng M3U8 mã hóa bằng `#ENC-AESGCM`:
+```text
+#ENC-AESGCM;iv=...
+#EXT-X-B65
+<BASE64_PAYLOAD>
+```
+
+App hỗ trợ tự động giải mã trực tiếp trong ExoPlayer (100% Native). Plugin có thể chỉ định khóa giải mã theo 2 cách:
+
+#### Cách 1: Khai báo trường `m3u8Key` trong JSON trả về
+```javascript
+return JSON.stringify({
+    "url": "https://cdn.example.com/playlist.m3u8",
+    "m3u8Key": "your_secret_aes_key_here", // Khóa AES-GCM của nguồn phim / kênh
+    "headers": {
+        "Referer": "https://cdn.example.com/",
+        "Origin": "https://cdn.example.com"
+    }
+});
+```
+
+#### Cách 2: Khai báo trong `headers` (`X-M3u8-Key` hoặc `M3u8-Key`)
+```javascript
+return JSON.stringify({
+    "url": "https://cdn.example.com/playlist.m3u8",
+    "headers": {
+        "Referer": "https://cdn.example.com/",
+        "Origin": "https://cdn.example.com",
+        "X-M3u8-Key": "your_secret_aes_key_here"
+    }
+});
+```
+
+---
+
+### 📱 Hướng Dẫn Viết Plugin Phim Ngắn / Short Drama (`"type": "shortfilm"`)
+
+Khi viết plugin cho các nguồn phim ngắn (Short Drama / Reels / Shortflix), khai báo `"type": "shortfilm"` để kích hoạt trải nghiệm trình phát xoay dọc và cử chỉ vuốt chuyển tập.
+
+#### Đặc điểm của Plugin `"shortfilm"` trong App:
+- Trình phát ExoPlayer tự động **xoay đứng màn hình (Portrait Mode)** và phóng to vừa khít chiều dọc điện thoại (`resizeMode = ZOOM`).
+- Hỗ trợ **cử chỉ vuốt dạng TikTok / Short Reels** trên Mobile:
+  - **Vuốt LÊN (Swipe UP)**: Chuyển sang **Tập tiếp theo**.
+  - **Vuốt XUỐNG (Swipe DOWN)**: Lùi về **Tập trước đó**.
+- Tự động bảo toàn trạng thái xoay đứng và vuốt tay chuyển tập liên tục xuyên suốt từ Tập 1 tới toàn bộ các tập tiếp theo.
+
+#### 1. Khai báo Manifest:
+```javascript
+function getManifest() {
+    return JSON.stringify({
+        "id": "shortflix",
+        "name": "Phim Ngắn Shortflix",
+        "description": "Kênh phim ngắn vietsub lồng tiếng",
+        "version": "1.0.0",
+        "baseUrl": "https://shortflix.net",
+        "type": "shortfilm",        // ⭐ Đánh dấu plugin loại Phim Ngắn
+        "playerType": "exoplayer"  // Khuyến nghị dùng exoplayer
+    });
+}
+```
+
+---
+
+## 📖 Hướng Dẫn Viết Plugin Truyện Tranh (Manga / Comic / Novel)
+
+VAAPP không chỉ là ứng dụng xem phim và truyền hình IPTV, mà còn tích hợp sẵn một **Trình Đọc Truyện Native (Compose Manga Reader)** cực mạnh, mượt mà và tối ưu sâu cho Manga (Nhật Bản), Manhwa (Hàn Quốc), Manhua (Trung Quốc), Comic (Âu Mỹ) và Tiểu thuyết (Novel).
+
+### 📑 Mục Lục Phần Này
+- [1. Đặc điểm của Plugin Truyện Tranh trong App](#1-đặc-điểm-của-plugin-truyện-tranh-trong-app)
+- [2. Khai báo Manifest cho Truyện Tranh](#2-khai-báo-manifest-cho-truyện-tranh)
+- [3. Cấu trúc Danh Sách Chương (`parseMovieDetail`)](#3-cấu-trúc-danh-sách-chương-parsemoviedetail)
+- [4. Trả Về Danh Sách Ảnh Chương (`parseDetailResponse`)](#4-trả-về-danh-sách-ảnh-chương-parsedetailresponse)
+  - [Cách A: Trả về Mảng Ảnh trực tiếp (Khuyên Dùng ⭐ - Native Reader)](#cách-a-trả-về-mảng-ảnh-trực-tiếp-khuyên-dùng--native-reader)
+  - [Cách B: Trả về Trang Web Đọc Truyện Nhúng (Embed WebView)](#cách-b-trả-về-trang-web-đọc-truyện-nhúng-embed-webview)
+- [5. Giải Quyết Triệt Để Lỗi Chặn Hotlink Ảnh (403 Forbidden / Anti-hotlink)](#5-giải-quyết-triệt-để-lỗi-chặn-hotlink-ảnh-403-forbidden--anti-hotlink)
+- [6. Kỹ Thuật Lọc Bỏ Ảnh Rác & Quảng Cáo CDN Bằng Javascript Filter](#6-kỹ-thuật-lọc-bỏ-ảnh-rác--quảng-cáo-cdn-bằng-javascript-filter)
+- [7. Các Tính Năng Vượt Trội Của Native Manga Reader Trong App](#7-các-tính-năng-vượt-trội-của-native-manga-reader-trong-app)
+- [8. Code Mẫu Hoàn Chỉnh Cho Plugin Truyện Tranh](#8-code-mẫu-hoàn-chỉnh-cho-plugin-truyện-tranh)
+
+---
+
+### <a id="1-đặc-điểm-của-plugin-truyện-tranh-trong-app"></a>1. Đặc điểm của Plugin Truyện Tranh trong App:
+- Khi người dùng bấm vào một bộ truyện, App sẽ mở **Màn hình Chi tiết Truyện** hiển thị ảnh bìa, tóm tắt, tác giả, thể loại và danh sách tất cả các Chapter/Chương.
+- Khi người dùng bấm đọc một Chapter (hoặc bấm nút "Đọc tiếp" từ Lịch sử), App sẽ gọi `parseDetailResponse()` để lấy **danh sách URL các trang ảnh** (`images: [...]`) và mở **Trình Đọc Truyện Native Compose** (thay vì mở ExoPlayer phát video).
+- Không cần xây dựng server proxy bên ngoài hay Cloudflare Worker để bypass chặn ảnh hotlink: Native App tự động xử lý toàn bộ headers và Referer ở tầng mạng OkHttp & Coil.
+
+---
+
+### <a id="2-khai-báo-manifest-cho-truyện-tranh"></a>2. Khai báo Manifest cho Truyện Tranh:
+```javascript
+function getManifest() {
+    return JSON.stringify({
+        "id": "my_manga_plugin",
+        "name": "Truyện Tranh Hay",
+        "version": "1.0.0",
+        "baseUrl": "https://manhwa-example.com",
+        "type": "COMIC",                // ⭐ Bắt buộc: "COMIC" hoặc "MANGA" hoặc "NOVEL"
+        "layoutType": "VERTICAL",       // Khuyên dùng: VERTICAL (tỉ lệ poster 2:3 chuẩn cho truyện)
+        "imageReferer": "https://manhwa-example.com/", // ⭐ Referer chung tải ảnh poster & ảnh truyện
+        "playerType": "exoplayer",      // "exoplayer" (hoặc "auto") để dùng Native Compose Reader
+        "isEnabled": true,
+        "isAdult": false
+    });
+}
+```
+
+> 💡 **Lưu ý về `imageReferer`:**
+> Nếu website truyện sử dụng CDN ảnh có cơ chế chống hotlink (kiểm tra header `Referer`), hãy khai báo `"imageReferer": "https://domain-goc.com/"`. App sẽ tự động gắn header này vào toàn bộ request tải ảnh bìa (poster) và ảnh chương truyện, không lo bị lỗi ảnh 403 Forbidden!
+
+---
+
+### <a id="3-cấu-trúc-danh-sách-chương-parsemoviedetail"></a>3. Cấu trúc Danh Sách Chương (`parseMovieDetail`):
+Trong hàm `parseMovieDetail()`, bạn trích xuất thông tin bộ truyện và danh sách các Chapter đặt vào mảng `servers[0].episodes`:
+
+```javascript
+function parseMovieDetail(html, apiUrl, datasend) {
+    var $doc = _$(html);
+    var title = $doc.find("h1.story-title").text().trim();
+    var posterUrl = $doc.find(".book-cover img").attr("src");
+    var description = $doc.find(".summary-content").text().trim();
+    var author = $doc.find(".author a").text().trim();
+    var status = $doc.find(".status-label").text().trim();
+
+    // Bóc tách danh sách Chapter:
+    var chapters = [];
+    $doc.find(".chapter-list a").each(function() {
+        var chapterUrl = this.attr("href");
+        var chapterName = this.text().trim();
+        // Trích xuất slug duy nhất (ví dụ: "chap-1", "chapter-120")
+        var chapterSlug = chapterUrl.replace(/\/$/, "").split("/").pop();
+
+        chapters.push({
+            id: chapterUrl,          // URL để App fetch nội dung chương
+            name: chapterName,       // Tên hiển thị (VD: "Chương 1", "Chap 50")
+            slug: chapterSlug        // ⭐ BẮT BUỘC DUY NHẤT CHO TỪNG CHƯƠNG
+        });
+    });
+
+    return JSON.stringify({
+        id: apiUrl.split("|")[0],
+        title: title,
+        posterUrl: posterUrl,
+        description: description,
+        casts: author,               // Dùng casts để chứa Tác giả
+        status: status,              // Đang tiến hành / Hoàn thành
+        servers: [
+            {
+                name: "Danh Sách Chương",
+                episodes: chapters   // Mảng các chapter truyện
+            }
+        ]
+    });
+}
+```
+
+> ⚠️ **QUY TẮC BẮT BUỘC VỀ `slug` CHƯƠNG:**
+> - Mỗi chapter trong `episodes` **bắt buộc phải có `slug` độc nhất** (ví dụ: `chap-1`, `chap-2`, `chapter-100`).
+> - **Tuyệt đối không đặt trùng slug** (như tất cả chapter đều để `"slug": "read"` hoặc `"full"`).
+> - **Lý do:** App dựa vào `slug` để:
+>   1. Đánh dấu chương đã đọc.
+>   2. Lưu và khôi phục chính xác vị trí trang ảnh (`pageIndex`) đang đọc dở.
+>   3. Tải ngầm chương kế tiếp (Preload) và kích hoạt tính năng **Đọc nối tiếp không giới hạn** (tự động nối chương sau vào cuối trang).
+
+---
+
+### <a id="4-trả-về-danh-sách-ảnh-chương-parsedetailresponse"></a>4. Trả Về Danh Sách Ảnh Chương (`parseDetailResponse`):
+
+Khi người dùng mở đọc một chương, App gửi URL chương đến server, nhận HTML thô và truyền vào `parseDetailResponse(html, apiUrl, datasend)`. Bạn có 2 cách trả dữ liệu:
+
+#### <a id="cách-a-trả-về-mảng-ảnh-trực-tiếp-khuyên-dùng--native-reader"></a>Cách A: Trả về Mảng Ảnh trực tiếp (Khuyên Dùng ⭐ - Native Reader)
+Đây là cách tối ưu nhất để người dùng có trải nghiệm đọc truyện tuyệt vời với đầy đủ tính năng của Native Reader:
+
+```javascript
+function parseDetailResponse(html, apiUrl, datasend) {
+    var images = [];
+    var $doc = _$(html);
+
+    // Cách 1: Dùng MiniJQ (_$) bóc thẻ <img> trong khung đọc truyện:
+    $doc.find(".reading-detail img, .page-chapter img").each(function() {
+        var src = this.attr("data-src") || this.attr("data-original") || this.attr("src");
+        if (src) {
+            images.push(src.trim());
+        }
+    });
+
+    // Cách 2: Nếu website nhúng mảng ảnh trong thẻ script JSON/JS:
+    // var match = html.match(/var\s+chapter_images\s*=\s*(\[[^\]]+\]);/);
+    // if (match) {
+    //     try { images = JSON.parse(match[1]); } catch(e) {}
+    // }
+
+    // Lọc bỏ banner quảng cáo / ảnh rác nếu có:
+    images = images.filter(function(url) {
+        return !url.includes("ads") && !url.includes("banner") && !url.includes("shopee");
+    });
+
+    return JSON.stringify({
+        images: images,              // Mảng các đường dẫn ảnh theo đúng thứ tự đọc
+        headers: {
+            "Referer": "https://manhwa-example.com/", // Header bypass chống hotlink ảnh
+            "Origin": "https://manhwa-example.com",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        },
+        isEmbed: false
+    });
+}
+```
+
+> 💡 **Khả Năng Tương Thích Dữ Liệu Của App (Lenient Keys):**
+> App tự động nhận diện danh sách ảnh từ nhiều khóa khác nhau trong JSON trả về:
+> - Khóa `images`: `["https://...1.jpg", "https://...2.jpg"]`
+> - Khóa `data`: `["https://...1.jpg", ...]`
+> - Khóa `pages`: `["https://...1.jpg", ...]`
+> - Khóa `chapter_images`: `["https://...1.jpg", ...]`
+> - Mảng Object: `[{"url": "https://...1.jpg"}, {"src": "https://...2.jpg"}]`
+> - Mảng JSON thuần: `["https://...1.jpg", "https://...2.jpg"]`
+
+#### <a id="cách-b-trả-về-trang-web-đọc-truyện-nhúng-embed-webview"></a>Cách B: Trả về Trang Web Đọc Truyện Nhúng (Embed WebView)
+Dành cho các trang truyện có cơ chế chống trích xuất quá phức tạp (render ảnh lên thẻ HTML5 Canvas đã bị mã hóa hoặc chia nhỏ ảnh thành nhiều ô ghép lại):
+
+```javascript
+function parseDetailResponse(html, apiUrl, datasend) {
+    return JSON.stringify({
+        url: apiUrl.split("|")[0],   // URL trang đọc truyện
+        isEmbed: true,               // Đánh dấu là web nhúng
+        headers: {
+            "Referer": "https://manhwa-example.com/"
+        }
+    });
+}
+```
+
+> 🛡️ **Cơ Chế WebView Thông Minh Của App:**
+> Khi ở chế độ Embed, App tự động:
+> 1. Intercept mọi request tải ảnh bên trong WebView, tự động đính kèm `Referer` và `Origin` tương ứng để không bị chặn ảnh.
+> 2. Chạy ngầm kịch bản tự động phát hiện và bấm đóng (Close / Dismiss / Skip) toàn bộ popup quảng cáo lơ lửng trên trang truyện.
+
+---
+
+### <a id="5-giải-quyết-triệt-để-lỗi-chặn-hotlink-ảnh-403-forbidden--anti-hotlink"></a>5. Giải Quyết Triệt Để Lỗi Chặn Hotlink Ảnh (403 Forbidden / Anti-hotlink):
+
+Rất nhiều nguồn truyện tranh lớn (như NetTruyen, CuuTruyen, ManhwaWeb...) bảo vệ CDN ảnh của họ bằng cách chặn tất cả request không có `Referer` hoặc có `Referer` không thuộc domain của họ (lỗi HTTP `403 Forbidden`).
+
+**Trước đây:** Các nhà phát triển phải dựng Cloudflare Worker hoặc reverse proxy để gắn header `Referer` tải ảnh trung gian, gây tốn băng thông và làm chậm tốc độ tải ảnh.
+
+**Hiện tại với VAAPP:**
+1. **Toàn Bộ Xử Lý Đều Native 100%:** App sử dụng bộ thư viện Coil & OkHttp tích hợp sẵn Native Interceptors.
+2. **Cơ Chế Tự Động Gắn Referer:**
+   - Nếu trong `parseDetailResponse()` có khai báo `headers: { "Referer": "..." }`, App sẽ gửi chính xác header đó cho từng trang ảnh của chương.
+   - Nếu trong chương không khai báo header riêng, App tự động lấy trường `imageReferer` (hoặc `referrer`) khai báo trong `getManifest()` để gán vào request ảnh.
+   - Đối với ảnh bìa / poster ngoài danh sách, App tự động chuyển tiếp param `_referer` vào chuỗi URL để `ImageRefererInterceptor` native nạp vào HTTP header.
+3. 👉 **Kết luận:** Dev plugin chỉ cần khai báo đúng `Referer` nguồn, ảnh sẽ tải mượt mà với tốc độ gốc tối đa mà **không cần bất kỳ server proxy nào**!
+
+---
+
+### <a id="6-kỹ-thuật-lọc-bỏ-ảnh-rác--quảng-cáo-cdn-bằng-javascript-filter"></a>6. Kỹ Thuật Lọc Bỏ Ảnh Rác & Quảng Cáo CDN Bằng Javascript Filter:
+
+Nhiều nguồn truyện chèn ảnh banner quảng cáo của nhà cái, banner mời tải app shopee hoặc ảnh giới thiệu nhóm dịch lặp đi lặp lại ở đầu và cuối mỗi chương. Bạn có thể làm sạch mảng ảnh ngay trong JavaScript trước khi trả về App:
+
+```javascript
+// Danh sách các từ khóa URL ảnh quảng cáo hoặc rác
+var AD_KEYWORDS = [
+    "quang-cao", "banner", "shopee", "betting", "casino",
+    "credit", "donate", "ads", "sponsor", "join-group"
+];
+
+// Lọc mảng ảnh:
+images = images.filter(function(imgUrl) {
+    if (!imgUrl || typeof imgUrl !== "string") return false;
+    var lower = imgUrl.toLowerCase();
+    
+    // Loại bỏ nếu URL chứa bất kỳ từ khóa quảng cáo nào
+    for (var i = 0; i < AD_KEYWORDS.length; i++) {
+        if (lower.indexOf(AD_KEYWORDS[i]) !== -1) {
+            return false;
+        }
+    }
+    
+    // Đảm bảo là đường dẫn ảnh hợp lệ
+    return lower.startsWith("http://") || lower.startsWith("https://");
+});
+```
+
+---
+
+### <a id="7-các-tính-năng-vượt-trội-của-native-manga-reader-trong-app"></a>7. Các Tính Năng Vượt Trội Của Native Manga Reader Trong App:
+
+Khi bạn trả về danh sách ảnh qua `images: [...]`, người dùng sẽ được tận hưởng trọn vẹn bộ tính năng đọc truyện cao cấp được xây dựng công phu:
+
+#### 📖 1. Đa dạng 5 Chế độ đọc linh hoạt:
+Người dùng có thể dễ dàng chuyển đổi chế độ đọc bất cứ lúc nào qua nút Cài Đặt (biểu tượng bánh răng ở góc trên bên phải):
+- **Webtoon (Cuộn dọc)**: Cuộn mượt mà từ trên xuống dưới theo phong cách Manhwa/Webtoon.
+- **Trang đơn (L→R - Trái sang phải)**: Lật từng trang từ trái sang phải như đọc sách thông thường.
+- **Manga (R→L - Phải sang trái)**: Lật từng trang theo chiều từ phải sang trái chuẩn Manga Nhật Bản.
+- **Trang đôi (L→R - Double Spread)**: App tự động xoay ngang màn hình (Landscape), ghép 2 trang ảnh song song cạnh nhau như trải rộng 2 trang sách giấy.
+- **Manga đôi (R→L - Double Spread Manga)**: App tự động xoay ngang màn hình, ghép 2 trang ảnh đọc từ phải sang trái chuẩn Manga Nhật Bản.
+
+#### 👆 2. Cử chỉ Chạm 2 mép màn hình (Edge Tapping):
+- Ở các chế độ **Trang đơn** và **Trang đôi**:
+  - Chạm vào **25% mép trái màn hình**: Lùi về trang trước (hoặc sang trang sau tùy theo chiều đọc LTR hay RTL).
+  - Chạm vào **25% mép phải màn hình**: Tiến sang trang kế tiếp.
+  - Chạm vào **50% ở giữa màn hình**: Bật/tắt thanh điều khiển (Controls Bar) và menu cài đặt.
+- Ở chế độ **Webtoon**: Chạm vào bất kỳ vị trí nào trên màn hình đều bật/tắt thanh điều khiển, không bắt cử chỉ mép để tránh chạm nhầm khi người dùng vuốt tay cuộn dọc.
+
+#### ♾️ 3. Đọc nối tiếp không giới hạn (Infinite / Continuous Reading):
+- Khi đọc ở chế độ Webtoon đến gần cuối chương hiện tại, App sẽ **tự động tải ngầm và nối tiếp chương tiếp theo vào cuối danh sách cuộn**.
+- Người dùng có thể đọc liền mạch hàng chục chương liên tục như một trang dài bất tận mà không bao giờ bị gián đoạn hay phải bấm nút "Chương sau".
+- Khi cuộn qua ranh giới giữa các chương, tiêu đề chương trên thanh trạng thái sẽ tự động cập nhật theo thời gian thực.
+
+#### ⏩ 4. Tự động cuộn theo nhịp VSync (Auto Scroll):
+- Tích hợp động cơ cuộn tự động đồng bộ theo nhịp khung hình màn hình phần cứng (VSync 60Hz/120Hz).
+- Hỗ trợ thanh trượt điều chỉnh tốc độ cuộn từ chậm đến nhanh (1x đến 5x).
+- Người dùng có thể rảnh tay hoàn toàn khi đọc truyện, chỉ cần chạm nhẹ vào màn hình để tạm dừng hoặc tiếp tục cuộn.
+
+#### 🌙 5. Thanh chỉnh độ sáng riêng biệt (Dark Scrim Filter):
+- Cho phép người đọc kéo thanh trượt điều chỉnh độ sáng màn hình từ 15% đến 100% trực tiếp ngay trong menu cài đặt của trình đọc.
+- Sử dụng lớp phủ Scrim đen tối ưu dịu mắt khi đọc truyện ban đêm trong phòng tối mà **tuyệt đối không làm thay đổi thiết lập độ sáng hệ thống của điện thoại**.
+
+#### 📌 6. Tự động lưu và cuộn đến đúng trang ảnh đang đọc dở (Auto-Resume):
+- App tự động ghi nhớ vị trí trang ảnh (`pageIndex`) mà bạn đang đọc dở vào cơ sở dữ liệu lịch sử theo thời gian thực (với cơ chế debounce tiết kiệm pin).
+- Khi người dùng quay lại đọc bộ truyện, App sẽ **tự động cuộn ngay lập tức đến đúng trang ảnh bạn đang đọc dở**, không cần phải tìm kiếm hay cuộn lại từ đầu.
+
+---
+
+### <a id="8-code-mẫu-hoàn-chỉnh-cho-plugin-truyện-tranh"></a>8. Code Mẫu Hoàn Chỉnh Cho Plugin Truyện Tranh:
+
+Dưới đây là mã nguồn hoàn chỉnh của một plugin truyện tranh mẫu sẵn sàng sử dụng:
+
+```javascript
+// =============================================================================
+// PLUGIN MANGA MẪU - VAAPP
+// =============================================================================
+
+function getManifest() {
+    return JSON.stringify({
+        "id": "demo_manga",
+        "name": "Manga Toon Demo",
+        "version": "1.0.0",
+        "baseUrl": "https://manhwa-demo.com",
+        "type": "COMIC",                // ⭐ Bắt buộc cho truyện tranh
+        "layoutType": "VERTICAL",       // Ảnh bìa đứng 2:3
+        "imageReferer": "https://manhwa-demo.com/", // Chống chặn ảnh hotlink
+        "playerType": "exoplayer",      // Dùng Native Manga Reader
+        "isEnabled": true
+    });
+}
+
+function getHomeSections() {
+    return JSON.stringify([
+        { slug: "truyen-moi", title: "Truyện Mới Cập Nhật", type: "Horizontal", path: "" },
+        { slug: "manhwa-hot", title: "Manhwa Thịnh Hành", type: "Horizontal", path: "" }
+    ]);
+}
+
+function getUrlList(slug, filtersJson) {
+    var page = JSON.parse(filtersJson || "{}").page || 1;
+    return "https://manhwa-demo.com/danh-sach/" + slug + "?page=" + page;
+}
+
+function parseListResponse(html, apiUrl) {
+    var $doc = _$(html);
+    var items = [];
+
+    $doc.find(".comic-item").each(function() {
+        var a = this.find("a.title-link");
+        var img = this.find("img");
+        items.push({
+            id: a.attr("href"),
+            title: a.text().trim(),
+            posterUrl: img.attr("data-src") || img.attr("src")
+        });
+    });
+
+    return JSON.stringify({
+        items: items,
+        pagination: { currentPage: 1, totalPages: 10 }
+    });
+}
+
+function getUrlDetail(slug) {
+    // Nếu slug đã là URL đầy đủ thì trả về luôn, nếu không thì ghép với baseUrl
+    if (slug.indexOf("http") === 0) return slug;
+    return "https://manhwa-demo.com/truyen/" + slug;
+}
+
+function parseMovieDetail(html, apiUrl) {
+    var $doc = _$(html);
+    var title = $doc.find("h1.title").text().trim();
+    var posterUrl = $doc.find(".poster img").attr("src");
+    var description = $doc.find(".summary").text().trim();
+    var author = $doc.find(".author a").text().trim();
+
+    var chapters = [];
+    $doc.find(".chapter-list li a").each(function() {
+        var href = this.attr("href");
+        var name = this.text().trim();
+        // Lấy slug độc nhất cho từng chapter
+        var slug = href.replace(/\/$/, "").split("/").pop();
+
+        chapters.push({
+            id: href,
+            name: name,
+            slug: slug
+        });
+    });
+
+    return JSON.stringify({
+        id: apiUrl.split("|")[0],
+        title: title,
+        posterUrl: posterUrl,
+        description: description,
+        casts: author,
+        servers: [
+            {
+                name: "Danh Sách Chương",
+                episodes: chapters
+            }
+        ]
+    });
+}
+
+function parseDetailResponse(html, apiUrl) {
+    var images = [];
+    var $doc = _$(html);
+
+    // Bóc tách toàn bộ ảnh trong khung đọc truyện
+    $doc.find(".chapter-content img").each(function() {
+        var src = this.attr("data-src") || this.attr("src");
+        if (src) images.push(src.trim());
+    });
+
+    // Lọc bỏ banner quảng cáo
+    images = images.filter(function(url) {
+        return !url.includes("ads") && !url.includes("banner");
+    });
+
+    return JSON.stringify({
+        images: images,
+        headers: {
+            "Referer": "https://manhwa-demo.com/",
+            "Origin": "https://manhwa-demo.com"
+        },
+        isEmbed: false
+    });
+}
+```
+
+---
+
+### 💾 Kỹ Thuật Truyền Dữ Liệu / Cache Biến Giữa Các Bước (State Management)
+
+Do engine QuickJS trong App chạy độc lập từng phiên (stateless), các biến toàn cục (global variables) sẽ bị xóa RAM sau khi chuyển màn hình hoặc reload engine.
+
+#### **Giải pháp chuẩn:** Đính kèm dữ liệu/token/key vào thuộc tính `id` hoặc `slug`
+
+Muốn mang dữ liệu gì từ `parseListResponse()` sang `parseMovieDetail()` hay `parseDetailResponse()`, bạn nhúng thông tin đó vào `id` / `slug` của item, dùng cú pháp `|data:`.
+
+> ⚠️ **Luôn dùng tiền tố `data:`** — xem chương [⚡ Quy Ước Dấu `|`](#-quy-ước-dấu--pipe--header-hay-data-của-plugin). Không có tiền tố mà dữ liệu chứa dấu `=` thì App sẽ hiểu nhầm thành HTTP header và bạn mất dữ liệu.
+
+##### Ví dụ 1: Nối chuỗi bằng `|data:` (Đơn giản, khuyến nghị)
+```javascript
+// Helper dùng chung: bóc phần data sau dấu |
+function getPipeData(raw) {
+    if (!raw) return "";
+    var i = raw.indexOf("|");
+    if (i < 0) return "";
+    var s = raw.substring(i + 1).replace(/^\s+/, "");
+    if (s.toLowerCase().indexOf("data:") === 0) s = s.substring(5);
+    return s;
+}
+
+// 1. Ở parseListResponse: Nối key vào id phim
+function parseListResponse(html, apiUrl) {
+    var secretKey = "ABC123XYZ";
+    return JSON.stringify({
+        "items": [
+            {
+                "id": "phim-hanh-dong-1|data:" + secretKey, // ⭐ có tiền tố data:
+                "title": "Phim Hay 1"
+            }
+        ]
+    });
+}
+
+// 2. Ở parseMovieDetail: Tách key ra dùng & truyền tiếp vào episode.id
+function parseMovieDetail(html, apiUrl) {
+    var myKey = getPipeData(apiUrl);        // => "ABC123XYZ"
+    var realSlug = apiUrl.split("|")[0];
+
+    return JSON.stringify({
+        "id": realSlug,
+        "title": "Phim Hay 1",
+        "servers": [{
+            "name": "Server 1",
+            "episodes": [{
+                "name": "Tập 1",
+                "slug": "tap-1",                       // slug phải DUY NHẤT cho từng tập
+                "id": "tap-1|data:" + myKey            // Truyền tiếp key vào id tập phim
+            }]
+        }]
+    });
+}
+
+// 3. Ở parseDetailResponse: Lấy lại key dùng để bóc link stream
+function parseDetailResponse(html, episodeUrl) {
+    var myKey = getPipeData(episodeUrl);    // => "ABC123XYZ"
+    return JSON.stringify({
+        "url": "https://server.com/stream?key=" + myKey,
+        "isEmbed": false
+    });
+}
+```
+
+> 🔍 **App đã fetch URL nào?** Với `id = "https://site.com/tap-1|data:ABC123XYZ"`, App gửi request tới đúng `https://site.com/tap-1`. Phần `|data:ABC123XYZ` **không** đi lên server nhưng vẫn có trong `episodeUrl`.
+
+##### Ví dụ 2: Mã hóa / Nén Dữ liệu LỚN hoặc Phức Tạp (Tránh vỡ cú pháp ID / URL)
+
+> [!WARNING]
+> **Lưu ý quan trọng về môi trường QuickJS:**
+> Môi trường QuickJS của ứng dụng **KHÔNG có sẵn** 2 hàm `btoa()` và `atob()` của trình duyệt Web.
+> Nếu dùng `atob()` trong khối `try { ... } catch(e) {}`, lỗi `ReferenceError: atob is not defined` sẽ bị nuốt im lặng, khiến dữ liệu giải mã bị rỗng `{}` mà không hiện lỗi ra console.
+
+Khi cần truyền Object chứa nhiều dữ liệu (Cookie, Token JWT, bối cảnh Session...), cách chuẩn nhất và tương thích 100% với QuickJS là sử dụng cặp hàm JS chuẩn: `encodeURIComponent()` và `decodeURIComponent()`.
+
+###### 🚀 Cách 1: Dùng `encodeURIComponent` & `decodeURIComponent` (Khuyên dùng - Có sẵn trong QuickJS)
+
+```javascript
+// 1. Ở parseListResponse: Mã hóa Object thành chuỗi URL safe đính vào ID
+function parseListResponse(html, apiUrl) {
+    var bigData = {
+        token: "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...",
+        session: "sess_9988776655",
+        quality: "1080p"
+    };
+
+    // Mã hóa JSON string thành chuỗi an toàn 1 dòng (không bị vỡ dấu |, ký tự đặc biệt, xuống dòng)
+    var encodedData = encodeURIComponent(JSON.stringify(bigData));
+
+    return JSON.stringify({
+        "items": [
+            {
+                "id": "phim-demo|data:" + encodedData,   // ⭐ tiền tố data:
+                "title": "Phim Demo"
+            }
+        ]
+    });
+}
+
+// 2. Ở parseDetailResponse: Giải mã ngược lại thành Object
+function parseDetailResponse(html, episodeUrl) {
+    var data = {};
+    var raw = getPipeData(episodeUrl);   // helper ở Ví dụ 1, đã tự bỏ tiền tố "data:"
+    if (raw) {
+        try {
+            data = JSON.parse(decodeURIComponent(raw)); // Giải mã URL-encode lại thành Object
+        } catch(e) {
+            console.error("Lỗi parse data:", e);
+        }
+    }
+
+    console.log(data.token);   // "eyJhbGciOi..."
+    console.log(data.session); // "sess_9988776655"
+
+    return JSON.stringify({
+        "url": "https://server.com/stream?token=" + (data.token || ""),
+        "isEmbed": false
+    });
+}
+```
+
+###### 💡 Cách 2: Nếu bắt buộc cần Base64 (Viết hàm Base64 thuần JS)
+
+Nếu logic của bạn bắt buộc phải tạo/đọc chuỗi mã hóa chuẩn Base64, hãy nhúng 2 hàm helper thuần JS dưới đây vào plugin (thay thế hoàn toàn cho `btoa`/`atob`):
+
+```javascript
+// Helper Base64 thuần JS (Tương thích 100% với QuickJS)
+function base64Encode(str) {
+    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+    var output = '';
+    var utf8Str = unescape(encodeURIComponent(str));
+    for (var block, charCode, idx = 0, map = chars;
+        utf8Str.charAt(idx | 0) || (map = '=', idx % 1);
+        output += map.charAt(63 & block >> 8 - idx % 1 * 8)) {
+        charCode = utf8Str.charCodeAt(idx += 3/4);
+        if (charCode > 255) {
+            throw new Error("'base64Encode' failed: string contains out of range characters");
+        }
+        block = block << 8 | charCode;
+    }
+    return output;
+}
+
+function base64Decode(input) {
+    var chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=';
+    var str = String(input).replace(/=+$/, '');
+    var output = '';
+    if (str.length % 4 === 1) {
+        throw new Error("'base64Decode' failed: invalid length");
+    }
+    for (var bc = 0, bs, buffer, idx = 0;
+        buffer = str.charAt(idx++);
+        ~buffer && (bs = bc % 4 ? bs * 64 + buffer : buffer,
+            bc++ % 4) ? output += String.fromCharCode(255 & bs >> (-2 * bc & 6)) : 0
+    ) {
+        buffer = chars.indexOf(buffer);
+    }
+    return decodeURIComponent(escape(output));
+}
+
+// Cách dùng trong Plugin:
+// var encoded = base64Encode(JSON.stringify(bigData));
+// var data = JSON.parse(base64Decode(encoded));
+```
+
+---
+
+## 🧪 Mẹo Debug
+
+### Trong tester.html:
+- Hàm `parseListResponse` / `parseMovieDetail` cần dán **HTML source** của trang web tương ứng
+- Hàm `getManifest` / `getHomeSections` chạy **không cần tham số**
+- Hàm `getUrlList` / `getUrlDetail` cần nhập **slug** vào ô input
+
+### Mẹo viết Regex:
+```javascript
+// Lấy tất cả <a> có class "movie-item"
+var regex = /<a[^>]*class="movie-item"[^>]*href="([^"]+)"[^>]*>[\s\S]*?<img[^>]*src="([^"]+)"[\s\S]*?<h3[^>]*>([^<]+)/g;
+var match;
+var items = [];
+while ((match = regex.exec(html)) !== null) {
+    items.push({
+        id: match[1].replace('/phim/', ''),
+        posterUrl: match[2],
+        title: match[3].trim()
+    });
+}
+```
+
+### QuickJS sandbox — Những thứ KHÔNG dùng được:
+❌ `document.querySelector()`,  `window.location`, `DOM API`
+❌ `require()`, `import` (Toàn bộ logic viết trong 1 file JS)
+
+### Những thứ DÙNG ĐƯỢC:
+✅ `JSON.parse()`, `JSON.stringify()`
+✅ `String.match()`, `String.replace()`, `String.split()`, `String.indexOf()`
+✅ `RegExp`, `/pattern/g.exec()`
+✅ `Array.map()`, `Array.filter()`, `Array.forEach()`
+✅ `try {} catch(e) {}`
+✅ `encodeURIComponent()`, `decodeURIComponent()`
+✅ `localStorage.getItem / setItem / removeItem / clear`
+✅ `getSetCookies(url, options)` — Lấy danh sách `Set-Cookie` mảng từ Server
+✅ `getSetCookie(url, options)` — Lấy chuỗi `Set-Cookie` gộp từ Server
+✅ `getResponseHeaders(url, options)` — Lấy toàn bộ Response Headers từ Server
+✅ `httpRequest(url, options)` — Gọi HTTP GET/POST/HEAD đồng bộ
+✅ `fetchAll(requests, options)` / `httpBatchRequest` — Cào mạng song song đa luồng (siêu tốc, Native OkHttp Pool) ⭐ (Mới)
+✅ `fetch(url, options)` — Tiêu chuẩn Web API fetch (polyfill đồng bộ `.json()`, `.text()`) ⭐ (Mới)
+✅ `getCookie(url)` — Đọc cookie đã lưu trong CookieManager của App
+✅ `toast(message)` — Hiển thị Toast thông báo
+✅ `console.log / warn / error / info / print` — In log ra Console của App
+✅ `AppCrypto.decryptAesGcm / decodeHex / encodeHex` — Giải mã và mã hóa dữ liệu
+
+---
+
+## 🌐 Chi Tiết Native Bridge APIs (HTTP & Cookies Server)
+
+### 1. `getSetCookies(url, options)`
+Gửi request đồng bộ đến máy chủ và trả về **mảng (`Array<string>`)** chứa tất cả các header `Set-Cookie` mà server phản hồi.
+
+```javascript
+// Gọi GET cơ bản
+var cookies = getSetCookies("https://domain-cua-trang.com");
+console.log("Danh sách Set-Cookie:", JSON.stringify(cookies));
+// Output: ["session=abc123xyz; Path=/; Secure; HttpOnly", "guest_id=987; Path=/"]
+
+// Gọi kèm custom headers
+var cookies = getSetCookies("https://domain-cua-trang.com", {
+    "User-Agent": "Mozilla/5.0...",
+    "Referer": "https://domain-cua-trang.com"
+});
+```
+
+### 2. `getSetCookie(url, options)`
+Gộp các cookie server trả về thành **một chuỗi đơn** cách nhau bằng `; `.
+
+```javascript
+var cookieStr = getSetCookie("https://domain-cua-trang.com");
+console.log("Cookie server:", cookieStr);
+toast("Cookie: " + cookieStr);
+```
+
+### 3. `getResponseHeaders(url, options)`
+Trả về một **Object chứa toàn bộ Response Headers** do server trả về:
+
+```javascript
+var headers = getResponseHeaders("https://domain-cua-trang.com");
+
+console.log("HTTP Status:", headers.status);
+console.log("Content-Type:", headers["content-type"]);
+console.log("Location:", headers["location"]);
+console.log("Set-Cookie:", JSON.stringify(headers["set-cookie"]));
+```
+
+### 4. `httpRequest(url, options)`
+Thực hiện HTTP request đồng bộ (hỗ trợ `GET`, `POST`, `HEAD`, `PUT`, `DELETE`), trả về `{ status, isSuccessful, url, headers, setCookies, body }`:
+
+```javascript
+var res = httpRequest("https://domain-cua-trang.com/api/login", {
+    method: "POST",
+    headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": "Mozilla/5.0..."
+    },
+    body: "username=my_user&password=my_password"
+});
+
+if (res && res.isSuccessful) {
+    console.log("Mã phản hồi:", res.status);
+    console.log("Cookies nhận được:", JSON.stringify(res.setCookies));
+    console.log("Nội dung body:", res.body);
+}
+```
+
+### 5. `fetchAll(requests, options)` / `httpBatchRequest(requests, options)` — Cào Mạng Song Song Đa Luồng (Siêu Tốc) ⭐ (Mới)
+
+Trước đây, khi cần lấy thông tin của nhiều tập phim hoặc gọi nhiều API cùng lúc, nếu dùng vòng lặp `for` với `httpRequest()`, các request sẽ phải chờ nhau lần lượt (tuần tự), khiến tổng thời gian chờ bị đội lên rất lâu (ví dụ 10 tập mất 10-15 giây).
+
+Hàm `fetchAll` (hoặc alias `httpBatchRequest`) giải quyết triệt để vấn đề này bằng cách **bắn đồng thời toàn bộ request trên Native Coroutine Dispatchers.IO và OkHttp Connection Pool của Android**. Thời gian lấy 10-20 tập phim giảm xuống **chỉ còn khoảng 0.5 - 1 giây**!
+
+#### Cách 1: Danh sách URL với Headers / Options dùng chung
+```javascript
+var urls = [
+    "https://api.example.com/episodes/1",
+    "https://api.example.com/episodes/2",
+    "https://api.example.com/episodes/3"
+];
+
+// Bắn song song cả 3 request cùng lúc
+var responses = fetchAll(urls, {
+    headers: {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Referer": "https://example.com/"
+    },
+    // vax: true // (Tùy chọn) Kích hoạt đi qua Virtual Local Proxy vax.local
+});
+
+// Kết quả là mảng response theo đúng thứ tự mảng urls truyền vào
+responses.forEach(function(res, index) {
+    if (res.isSuccessful) {
+        console.log("Tập " + (index + 1) + ":", res.body);
+    }
+});
+```
+
+#### Cách 2: Danh sách Request Object độc lập (Mỗi request có method, url, headers riêng)
+```javascript
+var requests = [
+    { url: "https://api.site.com/detail/101", method: "GET" },
+    { 
+        url: "https://api.site.com/ajax/token", 
+        method: "POST", 
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: "id=101&type=vip" 
+    },
+    { url: "https://api.site.com/detail/102", method: "GET" }
+];
+
+var results = fetchAll(requests);
+
+for (var i = 0; i < results.length; i++) {
+    var r = results[i];
+    console.log("URL:", r.url, "Status:", r.status, "Body length:", r.body.length);
+}
+```
+
+> 💡 **Cấu trúc trả về của mỗi phần tử trong `responses`**:
+> ```javascript
+> {
+>     status: 200,          // HTTP Status Code (number)
+>     isSuccessful: true,   // true nếu 200 <= status < 300
+>     url: "https://...",   // URL thực tế của request
+>     headers: { ... },     // Response Headers
+>     setCookies: [ ... ],  // Mảng Set-Cookie do server trả về
+>     body: "..."           // Nội dung phản hồi dạng chuỗi (text/JSON/HTML)
+> }
+> ```
+
+---
+
+### 6. `fetch(url, options)` — Chuẩn Web API Tiêu Chuẩn ⭐ (Mới)
+
+Nhằm giúp Dev dễ dàng tái sử dụng (copy-paste) các đoạn mã JavaScript viết cho trình duyệt hoặc Node.js mà không cần sửa lại thành `httpRequest`, VAAPP cung cấp sẵn hàm `fetch` theo chuẩn Web API (thực thi đồng bộ trong QuickJS Engine):
+
+```javascript
+// GET đơn giản
+var res = fetch("https://api.example.com/movie/phim-moi");
+if (res.ok) {
+    var data = res.json(); // Tự parse JSON thành Object
+    console.log("Tên phim:", data.title);
+}
+
+// POST với Headers và Body
+var res = fetch("https://api.example.com/auth", {
+    method: "POST",
+    headers: {
+        "Content-Type": "application/json"
+    },
+    body: JSON.stringify({ key: "secret_123" })
+});
+
+console.log("Status:", res.status);         // 200
+console.log("StatusText:", res.statusText); // "OK"
+console.log("Content-Type:", res.headers.get("content-type"));
+var text = res.text();                      // Lấy body dạng text
+```
+
+> **Các phương thức & thuộc tính của `fetch Response`**:
+> - `res.ok`: `true` nếu mã trạng thái nằm trong khoảng 200-299.
+> - `res.status`: Mã phản hồi HTTP (VD: `200`, `404`, `500`).
+> - `res.statusText`: Mô tả trạng thái (VD: `"OK"`, `"Not Found"`).
+> - `res.url`: URL thực tế.
+> - `res.headers`: Có hàm `headers.get(name)` hoặc truy cập trực tiếp `headers[name]`.
+> - `res.text()`: Trả về toàn bộ body dạng `String`.
+> - `res.json()`: Tự động chạy `JSON.parse(res.body)` và trả về Object/Array.
+
+---
+
+## 🧰 Thư Viện Tích Hợp Sẵn Trong QuickJS Engine (Built-in JS Libraries) ⭐ (Mới)
+
+Kể từ các phiên bản mới, **VAAPP đã tích hợp sẵn toàn bộ các thư viện phổ biến vào môi trường JavaScript QuickJS**. Nhà phát triển plugin **KHÔNG CẦN** phải copy-paste hàng trăm dòng thư viện (như MiniJQ `_$`, Base64, CryptoJS Decrypt) vào cuối file JS nữa, giúp mã nguồn plugin siêu tinh gọn, sáng sủa và chạy với hiệu năng native cực nhanh.
+
+---
+
+### 1. `_$(htmlString)` — MiniJQ Engine Phân Tích HTML DOM
+
+Cung cấp sẵn bộ phân tích DOM dạng jQuery rút gọn, hỗ trợ đầy đủ các thao tác tìm kiếm và trích xuất dữ liệu:
+
+* **Khởi tạo:** `var $doc = _$(html);`
+* **Tìm kiếm Selector:**
+  * `$doc.find(".movie-item")` — Tìm theo Class
+  * `$doc.find("#player")` — Tìm theo ID
+  * `$doc.find("a[href*='tap-']")` — Tìm theo Thuộc tính
+  * `$doc.find("li:content('Thể|loại:')")` — Tìm thẻ chứa từ khóa bất kỳ
+  * `$doc.find("div:first")` / `$doc.find("div:last")` / `$doc.find("div:eq(2)")`
+* **Trích xuất dữ liệu:**
+  * `.text()` — Lấy toàn bộ văn bản bên trong
+  * `.html()` — Lấy mã HTML bên trong
+  * `.attr("href")` / `.attr("src")` / `.attr("data-src")` — Lấy thuộc tính
+  * `.each(function(index, item) { ... })` — Lặp qua từng phần tử (trong callback `this` là đối tượng `MiniJQ` của phần tử hiện tại)
+* **Duyệt cây DOM:**
+  * `.first()`, `.last()`, `.eq(index)`
+  * `.parent()`, `.next()`, `.before()`, `.closest(selector)`
+
+```javascript
+// Ví dụ cào danh sách phim siêu ngắn gọn với _$
+function parseListResponse(html, url) {
+    var $doc = _$(html);
+    var items = [];
+    $doc.find(".film-item").each(function() {
+        items.push({
+            id: this.find("a").attr("href"),
+            title: this.find(".title").text().trim(),
+            posterUrl: this.find("img").attr("data-src") || this.find("img").attr("src")
+        });
+    });
+    return JSON.stringify({ items: items });
+}
+```
+
+---
+
+### 2. `getparam(url, paramName)` — Bóc Tách Tham Số Query An Toàn
+
+Hàm trích xuất giá trị của một query parameter từ URL (hoặc chuỗi URL có chứa pipe `|`):
+
+```javascript
+var url = "https://phim.com/watch?episodeID=12345&server=2|data:token_abc";
+
+var epId = getparam(url, "episodeID"); // "12345"
+var sv = getparam(url, "server");       // "2"
+var missing = getparam(url, "other");   // "" (không throw lỗi, trả về chuỗi rỗng an toàn)
+```
+
+---
+
+### 3. `BASE64.encode(str)` & `BASE64.decode(base64String)` — Mã Hóa & Giải Mã Base64 Chuẩn UTF-8
+
+Hỗ trợ mã hóa/giải mã Base64 hai chiều, tự động chuyển đổi ký tự tiếng Việt có dấu (UTF-8) và hỗ trợ cả URL-safe Base64 (`-` và `_`):
+
+```javascript
+// Mã hóa chuỗi tiếng Việt có dấu
+var encoded = BASE64.encode("Phim Lồng Tiếng 1080p"); 
+
+// Giải mã Base64
+var decoded = BASE64.decode(encoded); // "Phim Lồng Tiếng 1080p"
+
+// Giải mã link ẩn dạng aHR0cHM6...
+var directUrl = BASE64.decode("aHR0cHM6Ly9leGFtcGxlLmNvbS9zdHJlYW0ubTN1OA==");
+```
+
+---
+
+### 4. `CryptoJSAesDecrypt(passphrase, jsonStringOrObj)` — Giải Mã AES-CBC PBKDF2 (Native Cực Nhanh)
+
+Giải mã các payload bảo vệ video được mã hóa bởi CryptoJS dạng JSON (`{"ciphertext": "...", "iv": "...", "salt": "..."}`). App sử dụng cầu nối Native Kotlin (`SecretKeyFactory PBKDF2WithHmacSHA512` + `Cipher AES/CBC`) cho tốc độ giải mã tức thì (< 0.5ms):
+
+```javascript
+// html chứa đoạn mã: CryptoJSAesDecrypt('MySecretPass', '{"ciphertext":"...","iv":"...","salt":"..."}')
+var match = html.match(/CryptoJSAesDecrypt\s*\(\s*['"]([^'"]+)['"]\s*,\s*['"]?(\{[\s\S]*?\})['"]?\s*\)/i);
+if (match) {
+    var passphrase = match[1];
+    var encryptedJson = match[2];
+    var decryptedText = CryptoJSAesDecrypt(passphrase, encryptedJson);
+    console.log("Dữ liệu sau khi giải mã:", decryptedText);
+}
+```
+
+---
+
+### 5. `decodeHTMLtext(str)` — Giải Mã Ký Tự Thực Thể HTML (HTML Entities)
+
+Tự động chuyển đổi các ký tự entity như `&amp;`, `&#39;`, `&#x2F;` về chuỗi ký tự bình thường:
+
+```javascript
+var cleanTitle = decodeHTMLtext("Tom &amp; Jerry &#39;Special&#39;");
+// "Tom & Jerry 'Special'"
+```
+
+---
+
+## ⚡ Cơ Chế Native Video Stream Interceptors (Không Cần Cloudflare Worker) ⭐ (Mới)
+
+Trước đây, nhiều plugin phải gọi lên các Cloudflare Worker (`ggvideo.js`, `phimlongtieng.js`, `reverse proxy`) để xử lý các vấn đề về redirect 302, giải mã stream hoặc ngụy trang định dạng. 
+
+Hiện tại, **Native App đã tích hợp toàn bộ các Network Interceptor ở tầng thấp của ExoPlayer / OkHttp**, cho phép plugin trả về **URL GỐC TRỰC TIẾP**:
+
+### 1. Tự Động Xử Lý Google Video, Blogspot, Blogger, Google Drive (`GoogleVideoInterceptor`)
+* **Tự bắt Redirect 302**: Khi plugin trả về link `3.bp.blogspot.com`, `bp.blogspot.com`, `blogger.com`, `www.blogger.com`, App tự bắt `Location` chuyển hướng và resolve sang URL stream Google CDN gốc (`*.googlevideo.com/videoplayback?...`).
+* **Bảo toàn Header Range (HTTP 206 Partial Content)**: ExoPlayer tự do tua (seek) bất kỳ phân đoạn nào của video MP4 progressive mà không bị gián đoạn luồng stream.
+* **Tự vượt qua cảnh báo quét Virus Google Drive**: Với các file video dung lượng lớn (>100MB) trên `drive.google.com` hoặc `video-downloads.googleusercontent.com` thường bị trả về trang HTML cảnh báo, App tự bóc tách token `confirm` và cookie `download_warning_...` để tải stream thật.
+* **Chuẩn hóa Header & Chống 403 Forbidden**: App tự động lọc bỏ các header `Referer`/`Origin` bên thứ ba mà Google CDN từ chối, đồng thời gắn `User-Agent: Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36` chuẩn.
+* 👉 **Hướng dẫn cho Dev:** Plugin chỉ việc trả về URL video gốc (ví dụ: `https://3.bp.blogspot.com/...` hoặc `https://cdn.hdvideo.homes/stream/1080/...`), **tuyệt đối không cần gọi qua Worker `ggvideo.alokillgtv.workers.dev`**.
+
+### 2. Tự Động Giải Mã Segment Video Ngụy Trang Ảnh PNG (`TiktokPngInterceptor`)
+* Các nguồn phim sử dụng CDN TikTok / Byteimg / Phimhdc ngụy trang các đoạn video TS thành file ảnh `.png` (chứa dữ liệu video TS đóng gói base64 nén zlib ở các chunk `iTXt` của PNG).
+* Native App tự động phát hiện và giải nén trực tiếp trong RAM thành MPEG-TS chuẩn (`video/mp2t`). Plugin chỉ cần nạp link playlist `.m3u8` bình thường.
+
+---
+
+## 🛡️ Hệ Thống Virtual Local Proxy (vax.local) — Thay Thế Hoàn Toàn Cloudflare Worker ⭐ (Mới)
+
+Trước đây, nhiều nhà phát triển plugin phải tự triển khai các Cloudflare Worker cá nhân (như `test.js`, `proxy.js`, `reverse proxy`) để:
+1. Vượt rào cản CORS khi fetch dữ liệu hoặc stream trong WebView.
+2. Gắn header `Referer`, `User-Agent`, `Origin` tùy biến để bypass cơ chế chống hotlink.
+3. Fallback sang gateway dự phòng (`httprequest.net`) khi IP thiết bị bị rate-limit hoặc chặn.
+
+Tuy nhiên, việc phụ thuộc vào Cloudflare Worker bên ngoài bộc lộ nhiều hạn chế:
+- Bị giới hạn 100,000 request/ngày đối với tài khoản miễn phí.
+- Bị gián đoạn khi cáp quang biển gặp sự cố hoặc dải IP Cloudflare bị nhà mạng chặn.
+- Độ trễ vòng lặp cao (200ms - 500ms) do phải truyền qua máy chủ trung gian nước ngoài.
+
+### 🌟 Cơ Chế Native: Virtual Host Nội Bộ `https://vax.local`
+
+VAAPP đã tích hợp sẵn một **Virtual Local Proxy** chạy hoàn toàn trên máy người dùng:
+- **0ms latency trung gian**: Request được Native Client chặn (intercept) và xử lý trực tiếp trên thiết bị, không thông qua server proxy trung gian nào.
+- **Không giới hạn hạn ngạch (Unlimited)**: Chạy nội bộ trên điện thoại / TV Box của người dùng.
+- **Đồng bộ trên cả WebView và ExoPlayer**: Hoạt động mượt mà ở cả tầng trình duyệt web và tầng Native Media Player.
+
+---
+
+### 📌 Các Endpoint Hỗ Trợ
+
+#### 1. Endpoint Đơn Giản: `https://vax.local/fetch`
+Dùng để tải trang HTML, JSON API hoặc file m3u8 có kèm Headers tùy biến:
+
+```
+https://vax.local/fetch?url=<ENCODED_URL>&referer=<ENCODED_REF>&cookie=<ENCODED_COOKIE>&origin=<ENCODED_ORIGIN>&ua=<ENCODED_UA>
+```
+
+**Ví dụ trong JavaScript:**
+```javascript
+var targetUrl = "https://api.privatesite.com/video/master.m3u8";
+var proxyUrl = "https://vax.local/fetch?url=" + encodeURIComponent(targetUrl) 
+             + "&referer=" + encodeURIComponent("https://privatesite.com/")
+             + "&ua=" + encodeURIComponent("Mozilla/5.0 (Linux; Android 13)");
+
+// App sẽ tự động gửi request đến targetUrl với đúng Referer và UA trên!
+```
+
+---
+
+#### 2. Endpoint Tương Thích Hoàn Toàn với `test.js` & `proxy.js`: `https://vax.local/p` và `https://vax.local/px`
+
+Nếu bạn đang có sẵn logic mã hóa query `d` dạng Base64 / Base64Url từ các Cloudflare Worker cũ (`test.js`, `proxy.js`), bạn **CHỈ CẦN THAY DOMAIN THÀNH `https://vax.local/p` HOẶC `https://vax.local/px`** mà không cần viết lại mã nguồn plugin!
+
+```
+https://vax.local/p?d=<BASE64URL_PAYLOAD>
+https://vax.local/px?d=<BASE64URL_PAYLOAD> (Tự động kích hoạt chế độ fallback)
+```
+
+**Cấu trúc dữ liệu JSON đóng gói vào `d`:**
+```json
+{
+    "url": "https://api.example.com/stream.m3u8",
+    "headers": {
+        "Referer": "https://example.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13)"
+    },
+    "fallback": true
+}
+```
+
+**Ví dụ hàm tạo link proxy tương thích 100% trong Plugin:**
+```javascript
+function makeVaxProxyUrl(url, headers, useFallback) {
+    var payload = {
+        url: url,
+        headers: headers || {},
+        fallback: !!useFallback
+    };
+    // Mã hóa Base64 URL Safe
+    var jsonStr = JSON.stringify(payload);
+    var b64 = BASE64.encode(jsonStr)
+                    .replace(/\+/g, '-')
+                    .replace(/\//g, '_')
+                    .replace(/=+$/, '');
+                    
+    return "https://vax.local/p?d=" + b64;
+}
+
+// Sử dụng:
+var streamUrl = makeVaxProxyUrl("https://stream.server.com/playlist.m3u8", {
+    "Referer": "https://server.com/"
+}, true);
+```
+
+> 🛡️ **Cơ chế Tự Động Fallback Cứu Hộ (`fallback: true`)**:
+> Khi bạn bật `fallback: true` (hoặc gọi qua `/px`), nếu request trực tiếp từ mạng của người dùng bị lỗi (HTTP 403, 502 hoặc mất kết nối), Native App sẽ **tự động chuyển hướng request sang gateway `httprequest.net`** để vượt tường lửa — y hệt như logic trong Cloudflare Worker trước đây của bạn!
+
+---
+
+#### 3. Endpoint Trình Phát Web Player IPTV: `https://vax.local/tv` (Hoặc `tv/index.html`)
+
+Khi bạn cần nhúng giao diện Web Player IPTV (có sẵn danh sách kênh, chọn nhóm, EPG và trình phát Hls.js/Dash/FLV tích hợp) vào WebView:
+
+```
+https://vax.local/tv/index.html?url=<ENCODED_OR_BASE64_M3U_URL>
+hoặc
+https://vaxplugin.alokillgtv.workers.dev/tv/index.html?url=<ENCODED_OR_BASE64_M3U_URL>
+```
+
+App đã tích hợp sẵn giao diện Web Player IPTV vào bộ nhớ máy (0ms latency, không lo lỗi 401 Unauthorized từ worker):
+- Tham số `?url=`: Hỗ trợ cả link M3U trực tiếp hoặc chuỗi Base64 của link M3U (VD: `aHR0cHM6Ly9...`).
+- 💡 **Lưu ý quan trọng**: Do đây là trình phát Web tương tác (người dùng bấm chọn kênh trực tiếp trên giao diện Web), trong `parseDetailResponse()` hãy trả về `"isEmbed": true` (hoặc đặt `"playerType": "embed"` trong Manifest, hoặc thêm header `"Block-Sniffer": "true"`) để App giữ nguyên giao diện Web Player cho người dùng thao tác.
+
+```javascript
+return JSON.stringify({
+    url: "https://vax.local/tv/index.html?url=" + BASE64.encode("https://domain.com/list.m3u"),
+    isEmbed: true
+});
+```
+
+---
+
+## 🎬 Giải Pháp Cho Vấn Đề "M3U8 & Strict Referer" (Khắc Phục Lỗi Chặn Hotlink 403 Phân Đoạn .TS) ⭐ (Mới)
+
+Nhiều Dev băn khoăn: *"Khi một stream M3U8 yêu cầu Referer, file `master.m3u8` chứa hàng nghìn file phân đoạn `.ts`. Nếu player chỉ gửi Referer lúc tải `master.m3u8` thì các file `.ts` sau đó có bị lỗi 403 không? Dev có phải tự tải file m3u8 về rồi dùng regex sửa từng dòng link `.ts` qua proxy không?"*
+
+### ✅ Trường hợp 1: Khi phát bằng ExoPlayer (Native Player mặc định của VAAPP) — KHUYÊN DÙNG ⭐⭐⭐⭐⭐
+
+👉 **DEV HOÀN TOÀN KHÔNG CẦN SỬA ĐỔI NỘI DUNG FILE M3U8!**
+
+Trong `parseDetailResponse()`, bạn chỉ việc trả về:
+```javascript
+return JSON.stringify({
+    url: "https://cdn.domain.com/hls/master.m3u8",
+    headers: {
+        "Referer": "https://domain.com/",
+        "User-Agent": "Mozilla/5.0 (Linux; Android 13)"
+    }
+});
+```
+
+**Tại sao hoạt động hoàn hảo?**
+Hạ tầng `OkHttpDataSource` của Native ExoPlayer trong VAAPP được thiết kế để **tự động kế thừa và chuyển tiếp (propagate) toàn bộ Headers** bạn khai báo vào **TẤT CẢ các request tiếp theo**:
+- Master playlist (`master.m3u8`)
+- Media playlist con (`720p.m3u8`, `1080p.m3u8`)
+- 100% các phân đoạn video chunk (`segment-1.ts`, `segment-2.ts`, ...)
+- Các file giải mã DRM / AES-128 key (`enc.key`)
+
+Video chạy mượt 100%, tua (seek) tức thì mà không tốn công rewrite hay can thiệp vào cấu trúc playlist!
+
+---
+
+### ✅ Trường hợp 2: Khi phát bằng WebView (Embed / Hls.js / Web Player IPTV)
+
+Do cơ chế bảo mật Same-Origin Policy của trình duyệt web (WebView), các thẻ `<video>` hoặc thư viện Hls.js chạy trong môi trường web không cho phép tùy biến header `Referer` cho từng request `.ts`.
+
+Trước đây, dev phải dùng Cloudflare Worker để đọc file M3U8, parse từng dòng và viết lại (rewrite) link `.ts` trỏ về worker.
+
+🎉 **Hiện tại, Virtual Proxy nội bộ `vax.local` của VAAPP đã TỰ ĐỘNG REWRITE M3U8 Y HỆT CLOUDFLARE WORKER:**
+1. Khi bạn truyền link phát qua proxy:  
+   `https://vax.local/fetch?url=<ENCODED_M3U8_URL>&referer=<ENCODED_REFERER>&ua=<ENCODED_UA>`
+2. Virtual Proxy nội bộ của App sẽ:
+   - Tự động nhận diện nội dung trả về là Playlist M3U8 (`.m3u8`, MIME type HLS hoặc header `#EXTM3U`).
+   - Tự động giải quyết (resolve) tất cả các đường dẫn tương đối (relative paths) thành đường dẫn tuyệt đối chuẩn xác theo domain gốc của server CDN.
+   - **Tự động Rewrite (viết lại) từng dòng phân đoạn video (`.ts`, `.m4s`, `.aac`), sub-playlist chất lượng (`720p.m3u8`), và cả thẻ khóa giải mã DRM (`#EXT-X-KEY:URI="..."`, `#EXT-X-MAP:URI="..."`)** trỏ ngược về `https://vax.local/fetch?url=...&referer=...`.
+   - Gắn đầy đủ các CORS Headers (`Access-Control-Allow-Origin: *`) để trình duyệt Hls.js nhận diện luồng mượt mà.
+3. Nhờ đó:
+   - **Trình duyệt WebView / Hls.js tải từng segment con `.ts` đều đi qua proxy nội bộ và có đầy đủ header Referer / Origin / User-Agent** mà server CDN yêu cầu.
+   - Hoàn toàn triệt tiêu lỗi **403 Forbidden** và lỗi **404 Not Found** do sai đường dẫn tương đối!
+   - Tốc độ xử lý ngay trong bộ nhớ RAM của thiết bị (0ms network latency tới proxy ngoài), không tốn quota Cloudflare Worker.
+
+*(Tùy chọn: Nếu plugin của bạn muốn lấy nguyên bản file M3U8 gốc không qua rewrite, chỉ cần thêm param `&rewrite=false` hoặc `&raw=true` vào URL).*
+
+---
+
+## 🚑 Lỗi Thường Gặp & Cách Sửa
+
+### 1. `apiUrl` đúng nhưng `html` rỗng hoặc là `[]` / `{}`
+
+**Triệu chứng:**
+```
+[LOG] apiUrl: https://streamed.pk/api/stream/admin/abc|encodeData
+[LOG] html:   []
+```
+Nhưng mở `https://streamed.pk/api/stream/admin/abc` trên trình duyệt thì có dữ liệu.
+
+**Nguyên nhân:** phần sau `|` bị gửi lẫn lên server (bị mã hóa thành `%7C`), server trả về route không tồn tại.
+
+**Cách sửa:** thêm tiền tố `data:` → `.../abc|data:encodeData`. App sẽ fetch đúng `.../abc` và vẫn truyền `apiUrl` đầy đủ cho hàm parse.
+
+### 2. Dữ liệu sau `|` bị mất, App lại gắn thêm header lạ
+
+**Nguyên nhân:** data của bạn có dạng `key=value` (VD `|type=movie`) nên bị hiểu là HTTP header.
+
+**Cách sửa:** `|data:type=movie`.
+
+### 3. Đổi domain fallback xong bị 404
+
+**Nguyên nhân:** `baseUrl` có path (`https://a.com/wp`) còn domain fallback thì không.
+
+**Cách sửa:** App đã tự xử lý — chỉ cần khai `fallbackUrls` là các origin (`https://b.com`), App tự ghép lại path. Nếu vẫn sai, kiểm tra `baseUrl` có đúng phần path chung không.
+
+### 4. Domain tốt không bao giờ được dùng, App cứ bám domain hỏng
+
+**Nguyên nhân:** domain hỏng trả về trang Cloudflare/`Access denied` mà vẫn được coi là thắng cuộc đua rồi bị cache 10 phút.
+
+**Cách sửa:** App đã lọc các trang chặn phổ biến và response ngắn hơn 32 ký tự. Nếu API của bạn trả JSON ngắn (`[]`, `{"ok":1}`), hãy dùng endpoint có nội dung dài hơn để race. Người dùng có thể vào Quản lý Plugin đặt Base URL tùy chỉnh — lúc đó App bỏ qua race hoàn toàn.
+
+### 5. App vẫn dùng domain cũ sau khi đổi Base URL tùy chỉnh
+
+Đã được sửa: đổi/xóa Base URL tùy chỉnh sẽ **xóa cache domain ngay lập tức**, không phải chờ hết 10 phút.
+
+### 6. Preload chạy nhầm tập
+
+**Nguyên nhân:** mọi episode dùng chung một `slug` (VD `"full"`).
+
+**Cách sửa:** đặt `slug` duy nhất cho từng tập (`tap-1`, `tap-2`, `1080p`, `720p`…).
+
+---
+
+## 📁 Ví Dụ Thực Tế
+
+| Plugin | Độ khó | Kỹ thuật |
+|--------|--------|----------|
+| `ophim_plugin.js` | ⭐ Dễ | API trả JSON → `JSON.parse()` |
+| `kkphim_plugin.js` | ⭐⭐ Trung bình | API + HTML parse |
+| `vlxx_plugin.js` | ⭐⭐⭐ Nâng cao | AJAX POST + recursive embed + mimeType |
+
+🌐 Chúc bạn thành công! Đóng góp plugin cho cộng đồng nha!

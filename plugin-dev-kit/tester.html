@@ -1,0 +1,301 @@
+<!DOCTYPE html>
+<html lang="vi">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VAAPP Plugin Developer Tester</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+</head>
+
+<body class="bg-gray-900 text-gray-100 min-h-screen p-6 font-sans">
+    <div class="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <!-- Left Panel: Input & Plugin Load -->
+        <div class="space-y-6">
+            <h1 class="text-2xl font-bold border-b border-gray-700 pb-2">VAAPP Plugin Dev-Kit 🚀</h1>
+
+            <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+                <h2 class="text-xl font-semibold mb-3">1. Nạp file JS Plugin</h2>
+                <input type="file" id="pluginFile" accept=".js"
+                    class="block w-full text-sm text-gray-400 file:mr-4 file:py-2 file:px-4 file:rounded-md file:border-0 file:text-sm file:font-semibold file:bg-blue-600 file:text-white hover:file:bg-blue-700 mb-2" />
+                <p id="pluginStatus" class="text-sm text-red-400">Chưa nạp plugin nào.</p>
+            </div>
+
+            <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+                <h2 class="text-xl font-semibold mb-3">2. HTML Source / Tham số</h2>
+                <p class="text-xs text-gray-400 mb-2">Dán mã nguồn HTML (Ctrl+U trên trang web phim) hoặc nhập
+                    Slug vào đây:</p>
+                <textarea id="inputData" rows="10"
+                    class="w-full bg-gray-900 text-gray-200 p-3 rounded border border-gray-600 focus:outline-none focus:border-blue-500 font-mono text-sm"
+                    placeholder="<html>...</html> hoặc slug..."></textarea>
+            </div>
+
+            <div class="bg-gray-800 p-4 rounded-lg border border-gray-700">
+                <h2 class="text-xl font-semibold mb-3">3. Chạy Hàm Kiểm Tra</h2>
+                
+                <p class="text-xs text-gray-500 mb-2 uppercase tracking-wider">Config</p>
+                <div class="grid grid-cols-2 gap-2 mb-3">
+                    <button onclick="runFunction('getManifest')"
+                        class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded text-sm transition">getManifest()</button>
+                    <button onclick="runFunction('getHomeSections')"
+                        class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded text-sm transition">getHomeSections()</button>
+                    <button onclick="runFunction('getPrimaryCategories')"
+                        class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded text-sm transition">getPrimaryCategories()</button>
+                    <button onclick="runFunction('getFilterConfig')"
+                        class="bg-blue-600 hover:bg-blue-700 text-white font-medium py-2 px-4 rounded text-sm transition">getFilterConfig()</button>
+                </div>
+
+                <p class="text-xs text-gray-500 mb-2 uppercase tracking-wider">URL Builders</p>
+                <div class="grid grid-cols-2 gap-2 mb-3">
+                    <button onclick="runFunction('getUrlList')"
+                        class="bg-purple-600 hover:bg-purple-700 text-white font-medium py-2 px-4 rounded text-sm transition">getUrlList(slug)</button>
+                    <button onclick="runFunction('getUrlDetail')"
+                        class="bg-purple-600 hover:bg-purple-700 text-white font-medium py-2 px-4 rounded text-sm transition">getUrlDetail(slug)</button>
+                    <button onclick="runFunction('getUrlSearch')"
+                        class="bg-purple-600 hover:bg-purple-700 text-white font-medium py-2 px-4 rounded text-sm transition">getUrlSearch(keyword)</button>
+                </div>
+
+                <p class="text-xs text-gray-500 mb-2 uppercase tracking-wider">Parsers ⭐</p>
+                <div class="grid grid-cols-2 gap-2">
+                    <button onclick="runFunction('parseListResponse')"
+                        class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded text-sm transition">parseListResponse(html)</button>
+                    <button onclick="runFunction('parseSearchResponse')"
+                        class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded text-sm transition">parseSearchResponse(html)</button>
+                    <button onclick="runFunction('parseMovieDetail')"
+                        class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded text-sm transition">parseMovieDetail(html)</button>
+                    <button onclick="runFunction('parseDetailResponse')"
+                        class="bg-green-600 hover:bg-green-700 text-white font-medium py-2 px-4 rounded text-sm transition">parseDetailResponse(html)</button>
+                    <button onclick="runFunction('parseEmbedResponse')"
+                        class="bg-yellow-600 hover:bg-yellow-700 text-white font-medium py-2 px-4 rounded text-sm transition">parseEmbedResponse(html, url)</button>
+                </div>
+                
+                <!-- Source URL input for parsers -->
+                <div class="mt-3">
+                    <label class="text-xs text-gray-400">Source URL / API URL (cho các hàm parse/embed):</label>
+                    <input type="text" id="sourceUrl" placeholder="https://site.com/ajax.php"
+                        class="w-full mt-1 bg-gray-900 text-gray-200 p-2 rounded border border-gray-600 focus:outline-none focus:border-yellow-500 font-mono text-sm" />
+                </div>
+            </div>
+        </div>
+
+        <!-- Right Panel: Output -->
+        <div class="bg-gray-800 p-4 rounded-lg border border-gray-700 flex flex-col h-full">
+            <h2 class="text-xl font-semibold mb-3">4. Kết Quả (Output) 🖥️</h2>
+            <p class="text-xs text-gray-400 mb-2">
+                <span class="text-green-400">Xanh</span> = JSON chuẩn ✅ | 
+                <span class="text-red-400">Đỏ</span> = Lỗi cần sửa ❌
+            </p>
+            <textarea id="outputData" readonly
+                class="w-full flex-1 bg-gray-900 text-green-400 p-3 rounded border border-gray-600 focus:outline-none font-mono text-sm whitespace-pre"></textarea>
+        </div>
+    </div>
+
+    <script>
+        // =========================================================================
+        // BUILT-IN LIBRARIES MOCK FOR TESTER (Tương đương môi trường QuickJS của App)
+        // =========================================================================
+        function getparam(url, param) {
+            try {
+                if (!url || !param) return "";
+                var clean = url.split("|")[0];
+                var qIdx = clean.indexOf("?");
+                if (qIdx === -1) return "";
+                var qs = clean.substring(qIdx + 1);
+                var pairs = qs.split("&");
+                for (var i = 0; i < pairs.length; i++) {
+                    var p = pairs[i].split("=");
+                    if (decodeURIComponent(p[0]) === param) {
+                        return p.length > 1 ? decodeURIComponent(p.slice(1).join("=")) : "";
+                    }
+                }
+                return "";
+            } catch (e) {
+                return "";
+            }
+        }
+
+        var BASE64 = {
+            encode: function(str) {
+                try {
+                    return btoa(unescape(encodeURIComponent(str)));
+                } catch(e) {
+                    return "";
+                }
+            },
+            decode: function(str) {
+                try {
+                    var clean = str.replace(/-/g, "+").replace(/_/g, "/");
+                    while (clean.length % 4) clean += "=";
+                    return decodeURIComponent(escape(atob(clean)));
+                } catch(e) {
+                    return "";
+                }
+            }
+        };
+
+        function decodeHTMLtext(str) {
+            try {
+                if (!str) return "";
+                return str.replace(/&#(\d+);|&#x([0-9a-fA-F]+);/g, function(match, dec, hex) {
+                    if (dec) return String.fromCharCode(parseInt(dec, 10));
+                    if (hex) return String.fromCharCode(parseInt(hex, 16));
+                    return match;
+                }).replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+            } catch (e) {
+                return str;
+            }
+        }
+
+        // Tích hợp MiniJQ (_$) đơn giản cho trình duyệt
+        function _$(param) {
+            if (!param) return { find: () => ({ each: () => {}, text: () => "", attr: () => "" }), text: () => "", attr: () => "" };
+            if (typeof param === "string") {
+                const parser = new DOMParser();
+                const doc = parser.parseFromString(param, "text/html");
+                return wrapElement(doc.body);
+            }
+            return wrapElement(param);
+        }
+
+        function wrapElement(el) {
+            return {
+                find: function(sel) {
+                    try {
+                        const cleanSel = sel.replace(/:content\([^)]+\)/gi, "");
+                        const nodes = el.querySelectorAll(cleanSel || "*");
+                        return {
+                            length: nodes.length,
+                            each: function(cb) {
+                                nodes.forEach((n, idx) => cb.call(wrapElement(n), idx, wrapElement(n)));
+                            },
+                            text: function() { return nodes[0] ? nodes[0].textContent.trim() : ""; },
+                            html: function() { return nodes[0] ? nodes[0].innerHTML : ""; },
+                            attr: function(name) { return nodes[0] ? (nodes[0].getAttribute(name) || "") : ""; },
+                            first: function() { return nodes[0] ? wrapElement(nodes[0]) : wrapElement(null); },
+                            last: function() { return nodes[nodes.length - 1] ? wrapElement(nodes[nodes.length - 1]) : wrapElement(null); },
+                            eq: function(i) { return nodes[i] ? wrapElement(nodes[i]) : wrapElement(null); }
+                        };
+                    } catch(e) {
+                        return { each: () => {}, text: () => "", attr: () => "", length: 0 };
+                    }
+                },
+                text: function() { return el ? el.textContent.trim() : ""; },
+                html: function() { return el ? el.innerHTML : ""; },
+                attr: function(name) { return el ? (el.getAttribute(name) || "") : ""; }
+            };
+        }
+
+        // Load JS file
+        document.getElementById('pluginFile').addEventListener('change', function (e) {
+            const file = e.target.files[0];
+            if (!file) return;
+            const reader = new FileReader();
+            reader.onload = function (e) {
+                try {
+                    // Xóa hàm cũ
+                    ['getManifest', 'getHomeSections', 'getPrimaryCategories', 'getFilterConfig',
+                     'getUrlList', 'getUrlSearch', 'getUrlDetail',
+                     'parseListResponse', 'parseSearchResponse', 'parseMovieDetail',
+                     'parseDetailResponse', 'parseEmbedResponse'].forEach(f => window[f] = undefined);
+
+                    const script = document.createElement('script');
+                    script.textContent = e.target.result;
+                    document.body.appendChild(script);
+
+                    document.getElementById('pluginStatus').textContent = `✅ Đã nạp: ${file.name}`;
+                    document.getElementById('pluginStatus').classList.replace('text-red-400', 'text-green-400');
+                } catch (err) {
+                    document.getElementById('pluginStatus').textContent = `❌ Lỗi: ${err.message}`;
+                    document.getElementById('pluginStatus').classList.replace('text-green-400', 'text-red-400');
+                }
+            };
+            reader.readAsText(file);
+        });
+
+        function runFunction(funcName) {
+            const outBox = document.getElementById('outputData');
+            outBox.value = "";
+            outBox.classList.remove('text-red-400');
+            outBox.classList.add('text-green-400');
+
+            if (typeof window[funcName] !== 'function') {
+                outBox.classList.replace('text-green-400', 'text-red-400');
+                outBox.value = `❌ Hàm ${funcName}() chưa được định nghĩa trong plugin!\n\n` +
+                    (funcName === 'parseEmbedResponse' 
+                        ? '💡 Hàm này là TÙY CHỌN — chỉ cần khi trang dùng luồng embed phức tạp (AJAX → iframe → stream).'
+                        : '💡 Kiểm tra lại file JS đã nạp đúng chưa.');
+                return;
+            }
+
+            const inputArgs = document.getElementById('inputData').value;
+            const sourceUrl = document.getElementById('sourceUrl').value || 'https://example.com';
+
+            try {
+                let result;
+
+                if (funcName.startsWith('parse')) {
+                    if (!inputArgs) {
+                        console.warn("⚠️ Chưa nhập HTML source vào ô input.");
+                    }
+                    // Tất cả các hàm parse đều nhận html làm tham số 1 và url làm tham số 2
+                    result = window[funcName](inputArgs, sourceUrl);
+                } else if (funcName.startsWith('getUrl')) {
+                    result = window[funcName](inputArgs || "phim-le", "{}");
+                } else {
+                    result = window[funcName]();
+                }
+
+                // Format JSON (Tolerate trailing comma like App v1.7.5+)
+                try {
+                    let cleanResult = result;
+                    let hasTrailingComma = /,(\s*[\]}])/g.test(result);
+                    if (hasTrailingComma) {
+                        cleanResult = result.replace(/,(\s*[\]}])/g, '$1');
+                    }
+
+                    const parsed = JSON.parse(cleanResult);
+                    outBox.value = JSON.stringify(parsed, null, 4);
+
+                    if (hasTrailingComma) {
+                        outBox.value += '\n\n⚠️ CẢNH BÁO: Phát hiện dấu phẩy thừa (Trailing Comma) ở cuối JSON.\n📌 Mặc dù App v1.7.5+ tự sửa lỗi này, bạn nên bỏ dấu phẩy thừa để JSON đúng chuẩn.';
+                    }
+                    
+                    // Validation hints
+                    if (funcName === 'parseListResponse' || funcName === 'parseSearchResponse') {
+                        if (!parsed.items || !Array.isArray(parsed.items)) {
+                            outBox.value += '\n\n⚠️ Thiếu trường "items" (phải là Array)';
+                        } else if (parsed.items.length === 0) {
+                            outBox.value += '\n\n⚠️ Mảng items rỗng — kiểm tra lại regex parse';
+                        }
+                    }
+                    if (funcName === 'parseMovieDetail') {
+                        if (!parsed.servers || parsed.servers.length === 0) {
+                            outBox.value += '\n\n⚠️ Thiếu trường "servers" — App cần ít nhất 1 server có episodes';
+                        }
+                    }
+                    if (funcName === 'parseDetailResponse') {
+                        if (parsed.images && Array.isArray(parsed.images)) {
+                            outBox.value += '\n\n📖 [COMIC / MANGA] Phát hiện mảng ảnh (' + parsed.images.length + ' trang ảnh) → App sẽ mở Trình Đọc Truyện Native Compose Reader!';
+                        } else if (!parsed.url) {
+                            outBox.value += '\n\n⚠️ Thiếu trường "url" (cho Video/Phim) hoặc "images" (cho Truyện tranh/Manga)';
+                        }
+                        if (parsed.isEmbed) {
+                            outBox.value += '\n\n📌 isEmbed=true → App sẽ fetch URL này và gọi parseEmbedResponse() (hoặc mở WebView đọc truyện nếu là comic)';
+                        }
+                        if (parsed.mimeType) {
+                            outBox.value += '\n\n📌 mimeType="' + parsed.mimeType + '" → ExoPlayer sẽ dùng content type này';
+                        }
+                    }
+                } catch (e) {
+                    // Không phải JSON (các hàm getUrl trả String thường)
+                    outBox.value = result;
+                }
+            } catch (err) {
+                outBox.classList.replace('text-green-400', 'text-red-400');
+                outBox.value = `❌ LỖI THỰC THI:\n\n${err.stack || err.message}`;
+            }
+        }
+    </script>
+</body>
+
+</html>
