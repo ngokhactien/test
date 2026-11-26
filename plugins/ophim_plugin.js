@@ -6,9 +6,9 @@ function getManifest() {
     return JSON.stringify({
         "id": "ophim",
         "name": "OPhim",
-        "version": "1.0.4",
+        "version": "1.0.3",
         "baseUrl": "https://ophim1.com",
-        "iconUrl": "https://raw.githubusercontent.com/youngbi/repo/main/plugins/ophim.ico",
+        "iconUrl": "https://stpaulclinic.vn/vaapp/plugins/ophim.ico",
         "isEnabled": true,
         "type": "MOVIE"
     });
